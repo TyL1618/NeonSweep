@@ -213,8 +213,12 @@ class DevSpacePage(QWidget):
         return page
 
     def _on_scan_finished(self, results: list[dict]) -> None:
+        cancelled = bool(self._worker and self._worker.cancelled)
         self._thread = None
         self._worker = None
+        if cancelled:
+            self._stack.setCurrentWidget(self._setup_page)
+            return
         self._rows = sorted(results, key=lambda r: -r["size"])
         self._populate_table()
         self._stack.setCurrentWidget(self._results_page)

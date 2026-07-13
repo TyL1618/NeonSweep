@@ -394,6 +394,10 @@ def find_devspaces(drives: list[str], progress_cb=None, cancel_check=None) -> li
                 except OSError:
                     continue
 
+                norm_path = os.path.normcase(entry.path)
+                if any(os.path.normcase(ex) in norm_path for ex in EXCLUDED_DIRS):
+                    continue
+
                 name = entry.name
                 is_target = name == "target" and os.path.isfile(
                     os.path.join(os.path.dirname(entry.path), "Cargo.toml")

@@ -248,8 +248,12 @@ class BigFilePage(QWidget):
         return page
 
     def _on_scan_finished(self, result: list[tuple]) -> None:
+        cancelled = bool(self._worker and self._worker.cancelled)
         self._thread = None
         self._worker = None
+        if cancelled:
+            self._stack.setCurrentWidget(self._setup_page)
+            return
 
         reliability = {d: analysis.atime_reliable(d) for d in getattr(self, "_scanned_drives", [])}
         self._rows = []

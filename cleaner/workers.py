@@ -98,6 +98,10 @@ class BigFileWorker(QObject):
     def cancel(self):
         self._cancelled = True
 
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
     def run(self):
         result = analysis.scan_top_files(
             self._drives,
@@ -124,6 +128,10 @@ class DupeWorker(QObject):
     def cancel(self):
         self._cancelled = True
 
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
     def run(self):
         result = analysis.find_duplicates(
             self._drives,
@@ -148,6 +156,10 @@ class DevSpaceWorker(QObject):
 
     def cancel(self):
         self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
 
     def run(self):
         result = analysis.find_devspaces(

@@ -24,7 +24,7 @@ from .. import analysis, theme
 from ..utils.fs import display_path, format_size, list_drives
 from ..widgets.neon_progress import NeonProgressBar
 from ..workers import DupeWorker
-from .common import ChipRow, confirm_delete, safe_trash_delete
+from .common import HUGE_FILE_THRESHOLD, ChipRow, confirm_delete, safe_trash_delete
 
 PATH_ELIDE_WIDTH = 480
 MIN_SIZE_OPTIONS = [("500 KB", 500 * 1024), ("1 MB", 1024 * 1024), ("10 MB", 10 * 1024 * 1024), ("100 MB", 100 * 1024 * 1024)]
@@ -277,8 +277,12 @@ class DupePage(QWidget):
         return panel
 
     def _on_scan_finished(self, groups: list[list[str]]) -> None:
+        cancelled = bool(self._worker and self._worker.cancelled)
         self._thread = None
         self._worker = None
+        if cancelled:
+            self._stack.setCurrentWidget(self._setup_page)
+            return
 
         self._groups = []
         for group_paths in groups:
@@ -416,7 +420,9 @@ class DupePage(QWidget):
         if not entries:
             return
         total_size = sum(d["size"] for _c, d in entries)
-        if not confirm_delete(self, "刪除重複檔案", f"確定要刪除勾選的 {len(entries)} 個檔案嗎?\n總計 {format_size(total_size)}"):
+        huge = any(d["size"] > HUGE_FILE_THRESHOLD for _c, d in entries)
+        msg = f"確定要刪除勾選的 {len(entries)} 個檔案嗎?\n總計 {format_size(total_size)}"
+        if not confirm_delete(self, "刪除重複檔案", msg, huge_file=huge):
             return
 
         failures = []
