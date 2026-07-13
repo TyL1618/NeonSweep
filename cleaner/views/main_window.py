@@ -20,6 +20,7 @@ from ..widgets.glow_line import GlowLine
 from .bigfile_page import BigFilePage
 from .clean_page import CleanPage
 from .devspace_page import DevSpacePage
+from .diagnostic_page import DiagnosticPage
 from .dupe_page import DupePage
 
 NAV_ITEMS = [
@@ -27,6 +28,7 @@ NAV_ITEMS = [
     ("bigfile", "📦", "大檔案"),
     ("dupe", "⧉", "重複檔案"),
     ("devspace", "⌘", "開發空間"),
+    ("diagnostic", "🩺", "系統診斷"),
 ]
 
 
@@ -62,12 +64,14 @@ class MainWindow(QMainWindow):
         self._bigfile_page = BigFilePage()
         self._dupe_page = DupePage()
         self._devspace_page = DevSpacePage()
+        self._diagnostic_page = DiagnosticPage()
 
         self._pages = {
             "clean": self._clean_page,
             "bigfile": self._bigfile_page,
             "dupe": self._dupe_page,
             "devspace": self._devspace_page,
+            "diagnostic": self._diagnostic_page,
         }
         for page in self._pages.values():
             self._stack.addWidget(page)

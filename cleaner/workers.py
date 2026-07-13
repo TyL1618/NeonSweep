@@ -1,6 +1,6 @@
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from . import analysis
+from . import analysis, diagnostics
 from .modules.base import ScanCancelled
 
 
@@ -168,3 +168,58 @@ class DevSpaceWorker(QObject):
             cancel_check=lambda: self._cancelled,
         )
         self.finished.emit(result)
+
+
+class DiagnosticWorker(QObject):
+    """唯讀系統空間診斷:依序查詢 WinSxS / 驅動殘留 / 休眠檔 / 分頁檔 / System Restore。
+    純讀取,不屬於 DEVDOC 原始規格,不提供任何刪除功能。
+    """
+
+    category_started = pyqtSignal(str)                 # category key
+    category_finished = pyqtSignal(str, object)          # category key, result dict
+    progress = pyqtSignal(str, int, int)                  # category key, count, bytes so far
+    finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def _cancel_check(self):
+        return self._cancelled
+
+    def run(self):
+        for key, checker in (
+            ("winsxs", diagnostics.winsxs_size),
+            ("driverstore", diagnostics.driverstore_size),
+        ):
+            if self._cancelled:
+                self.finished.emit()
+                return
+            self.category_started.emit(key)
+            size, count, complete = checker(
+                progress_cb=lambda c, b, k=key: self.progress.emit(k, c, b),
+                cancel_check=self._cancel_check,
+            )
+            self.category_finished.emit(key, {"size": size, "count": count, "complete": complete})
+
+        if self._cancelled:
+            self.finished.emit()
+            return
+
+        self.category_started.emit("hiberfil")
+        self.category_finished.emit("hiberfil", {"size": diagnostics.hibernation_file_size()})
+
+        self.category_started.emit("pagefile")
+        self.category_finished.emit("pagefile", {"size": diagnostics.pagefile_size()})
+
+        self.category_started.emit("shadow_copy")
+        self.category_finished.emit("shadow_copy", {"size": diagnostics.shadow_copy_used_size()})
+
+        self.finished.emit()

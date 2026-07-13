@@ -23,6 +23,7 @@ a = Analysis(
         'cleaner.report',
         'cleaner.workers',
         'cleaner.analysis',
+        'cleaner.diagnostics',
         'cleaner.utils',
         'cleaner.utils.fs',
         'cleaner.utils.admin',
@@ -35,6 +36,7 @@ a = Analysis(
         'cleaner.modules.crash_dumps',
         'cleaner.modules.windows_update',
         'cleaner.modules.dev_caches',
+        'cleaner.modules.ai_caches',
         'cleaner.modules.recycle_bin',
         'cleaner.widgets',
         'cleaner.widgets.neon_button',
@@ -48,6 +50,7 @@ a = Analysis(
         'cleaner.views.bigfile_page',
         'cleaner.views.dupe_page',
         'cleaner.views.devspace_page',
+        'cleaner.views.diagnostic_page',
         # send2trash 的 Windows 後端是條件式 import,明確列出避免凍結後漏打包
         'send2trash',
         'send2trash.win',
