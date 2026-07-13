@@ -1,4 +1,4 @@
-"""產生 NeonSweep 的 icon.ico(黑底 + 粉藍漸層圓環,呼應 App 的 cyberpunk 主題)。
+"""產生 NeonSweep 的 icon.ico(透明底 + 粉藍漸層圓環,呼應 App 的 cyberpunk 主題)。
 只在需要重新產生圖示時手動執行:python scripts/gen_icon.py
 """
 
@@ -11,7 +11,7 @@ BASE_SIZE = 256
 
 NEON_PINK = (255, 46, 136)
 NEON_BLUE = (0, 229, 255)
-BG = (0, 0, 0, 255)
+BG = (0, 0, 0, 0)  # 全透明,去掉黑底
 
 
 def make_base_icon(size: int) -> Image.Image:
