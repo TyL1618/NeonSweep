@@ -1,6 +1,6 @@
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from . import analysis, diagnostics
+from . import analysis, diagnostics, smart_health
 from .modules.base import ScanCancelled
 
 
@@ -222,4 +222,39 @@ class DiagnosticWorker(QObject):
         self.category_started.emit("shadow_copy")
         self.category_finished.emit("shadow_copy", {"size": diagnostics.shadow_copy_used_size()})
 
+        self.finished.emit()
+
+
+class SmartHealthWorker(QObject):
+    """磁碟健康(S.M.A.R.T.)診斷:依序查詢每顆實體磁碟,唯讀,不提供任何修復功能。"""
+
+    device_found = pyqtSignal(dict)   # 每查完一顆磁碟就 emit 一次健康摘要 dict
+    finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self):
+        for dev in smart_health.scan_devices():
+            if self._cancelled:
+                break
+            device = dev.get("name")
+            if not device:
+                continue
+            dev_type = dev.get("type")
+            health = smart_health.query_health(device, dev_type) or {
+                "device": device,
+                "type": dev_type,
+                "model": device,
+                "passed": None,
+            }
+            self.device_found.emit(health)
         self.finished.emit()

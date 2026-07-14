@@ -15,6 +15,10 @@ a = Analysis(
     binaries=[],
     datas=[
         ('icon.ico', '.'),
+        # 第三方工具 smartmontools(GPLv2,https://www.smartmontools.org),不隨 git 版控,
+        # 需自行下載後放到 third_party/smartmontools/,見 DEVDOC.md §13.1。
+        # 目錄不存在時 PyInstaller 會直接報錯,打包磁碟健康功能前務必先放好檔案。
+        ('third_party/smartmontools', 'third_party/smartmontools'),
     ],
     hiddenimports=[
         'cleaner',
@@ -24,6 +28,7 @@ a = Analysis(
         'cleaner.workers',
         'cleaner.analysis',
         'cleaner.diagnostics',
+        'cleaner.smart_health',
         'cleaner.utils',
         'cleaner.utils.fs',
         'cleaner.utils.admin',
@@ -51,6 +56,7 @@ a = Analysis(
         'cleaner.views.dupe_page',
         'cleaner.views.devspace_page',
         'cleaner.views.diagnostic_page',
+        'cleaner.views.health_page',
         # send2trash 的 Windows 後端是條件式 import,明確列出避免凍結後漏打包
         'send2trash',
         'send2trash.win',

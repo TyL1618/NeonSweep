@@ -5,3 +5,8 @@ __pycache__/
 .env
 dist/
 build/
+
+# 第三方 smartmontools 二進位檔(GPLv2,需自行下載,見 third_party/smartmontools/PLACE_FILES_HERE.txt)
+third_party/smartmontools/*.exe
+third_party/smartmontools/*.h
+third_party/smartmontools/LICENSE.txt

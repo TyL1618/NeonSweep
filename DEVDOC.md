@@ -182,6 +182,7 @@ class CleanerModule:
 | `crash_dumps` | 錯誤報告與傾印檔 | ✓ | 0 |
 | `windows_update` | Windows Update 快取 | ✓ | 0 |
 | `dev_caches` | 開發者快取 | ✗ | 0 |
+| `ai_caches` | AI 工具快取 | ✗ | 0 |
 | `recycle_bin` | 資源回收桶 | ✗ | 0 |
 
 **`user_temp`** — 掃描 `%TEMP%`(即 `%LOCALAPPDATA%\Temp`)整棵樹。
@@ -221,6 +222,15 @@ yarn  : %LOCALAPPDATA%\Yarn\Cache
 NuGet : %LOCALAPPDATA%\NuGet\v3-cache
 ```
 注意:**不要**清 `%USERPROFILE%\.nuget\packages`(那是專案正在引用的套件本體,不是快取)。
+
+**`ai_caches`**(使用者後續要求新增,不屬於 M1-M5 原始規格)— HuggingFace / PyTorch Hub / InsightFace 的模型下載快取,以及 NVIDIA CUDA 編譯快取。刪了只是下次使用時該套件自動重新下載/重新編譯,不是唯一副本。存在才列入:
+```
+HuggingFace : %USERPROFILE%\.cache\huggingface
+PyTorch Hub : %USERPROFILE%\.cache\torch
+InsightFace : %USERPROFILE%\.insightface
+CUDA 編譯快取: %LOCALAPPDATA%\NVIDIA\ComputeCache
+```
+注意:部分模型檔案單一就是好幾 GB,PREVIEW 頁照常顯示大小讓使用者自行評估,不特別加額外警語。
 
 **`recycle_bin`** — 特殊模組,`is_api_module = True`,不列個別檔案。用 ctypes:
 
@@ -542,6 +552,25 @@ def atime_reliable(drive_root: str) -> bool:
 - 表格:專案路徑、類型(node_modules/venv/…)、大小、最後活動。依大小遞減。超過 180 天未動的列,最後活動欄顯示粉色標記「久未使用」。
 - 操作:「開啟位置」+「刪除」(確認對話框寫明「重新安裝依賴即可復原(npm install / pip install)」→ `send2trash`)。**不提供全選刪除**,一次刪一個,防手滑。
 
+### 8.5 系統空間診斷(`diagnostic_page.py` / `diagnostics.py`)— 唯讀,零刪除
+
+使用者後續要求新增,不屬於 M1-M5 原始規格。這裡列的都是「風險太高、這套工具不會去清」的系統空間佔用類別,只負責讀取/估算大小並顯示,**不提供任何刪除功能**——凡是這套工具沒把握安全逐檔刪除的東西,寧可只顯示數字、附上建議的外部工具,也不要冒險自己動手。呼應 §5 規則 1 的白名單精神。
+
+五個類別,依序查詢:
+
+| key | 顯示名稱 | 資料來源 | 建議處理方式 |
+|---|---|---|---|
+| `winsxs` | 元件存放區(WinSxS) | `safe_walk` 累計 `%SystemRoot%\WinSxS` 大小 | 磁碟清理→清理系統檔案,或 `DISM /Online /Cleanup-Image /StartComponentCleanup` |
+| `driverstore` | 驅動殘留(DriverStore) | `safe_walk` 累計 `%SystemRoot%\System32\DriverStore\FileRepository` 大小 | 驅動廠商解安裝工具(如 NVIDIA DDU)或裝置管理員手動移除舊版 |
+| `hiberfil` | 休眠檔 | `os.path.getsize` 讀 `%SystemDrive%\hiberfil.sys` | 不需要休眠功能的話 `powercfg /hibernate off` |
+| `pagefile` | 分頁檔 | `os.path.getsize` 讀 `%SystemDrive%\pagefile.sys` | 通常不需處理 |
+| `shadow_copy` | System Restore 還原點 | `vssadmin list shadowstorage /for=<drive>` 解析輸出 | 控制台→系統保護→調整還原點磁碟空間上限 |
+
+**實作細節:**
+- WinSxS/DriverStore 用 `safe_walk` 遞迴加總,權限錯誤時 `complete=False`,UI 顯示「部分項目因權限被略過,僅供參考」而非假裝精確。
+- `vssadmin` 輸出的文字標籤會隨系統語系不同,**不比對標籤字串**,改用正規表示式 `([\d.]+)\s*(TB|GB|MB|KB|B)\s*\((\d+)%\)` 抓「數字+單位+百分比」格式,固定取第一筆(Used,vssadmin 固定先印 Used 再印 Allocated/Maximum)。失敗(非管理員、`vssadmin` 不存在、逾時)一律回傳 `None`,UI 顯示「無法讀取(可能需要管理員權限)」。
+- 五個類別依序查詢(非平行),前兩個是耗時的目錄樹掃描、有進度回報,後三個是單一系統呼叫、即查即回。
+
 ---
 
 ## 9. 管理員權限(`utils/admin.py`)
@@ -686,3 +715,60 @@ PyInstaller `--noconsole --onefile`,manifest 維持 asInvoker,附 icon。
 - [ ] 刪除前驗證:掃描後改動某檔案內容再執行刪除 → 該檔被拒刪並回報
 - [ ] 清理完成後磁碟燈條數字有更新
 - [ ] 視窗在清理中直接關閉 → 執行緒正常收尾,無崩潰訊息
+
+---
+
+## 13. 磁碟健康診斷(SMART,加分功能 5)
+
+`cleaner/smart_health.py`(純邏輯,Qt-free)+ `cleaner/workers.py` 的 `SmartHealthWorker` +
+`cleaner/views/health_page.py`。跟 §9 的系統空間診斷同一種精神:**唯讀,不提供任何修復
+功能**——健康狀態異常時只顯示「良好/異常/未知」跟關鍵指標,使用者應自行備份資料並更換
+硬碟,這套工具不會、也不該代為處理。
+
+### 13.1 第三方依賴:smartmontools
+
+磁區壞軌/健康值是硬碟韌體層級的 S.M.A.R.T. 資料,不同廠牌/控制器的相容性資料庫太龐大,
+不值得也不該自己重寫解析邏輯(等於重寫 smartmontools 十幾年累積的裝置相容性資料庫)。
+所以底層直接呼叫開源工具 **smartmontools**(GPLv2,<https://www.smartmontools.org>)的
+`smartctl.exe`,以獨立子行程呼叫、不修改、不重新散布原始碼——這是 GPL 認可的
+「單純聚合(mere aggregation)」用法,不會傳染到本專案的授權。
+
+需要的檔案(**不隨 git 版控**,見 `.gitignore`):
+
+```
+third_party/smartmontools/
+├── smartctl.exe
+├── drivedb.h
+└── LICENSE.txt        ← 打包散布時務必附上這份 GPLv2 授權聲明
+```
+
+取得方式:自行到官方網站下載 Windows 版本,解壓縮後把 `smartctl.exe`、`drivedb.h`
+放進上述資料夾;`LICENSE.txt` 從壓縮包內附的授權檔複製過來。放置細節見
+`third_party/smartmontools/PLACE_FILES_HERE.txt`。
+
+路徑解析用 `utils/fs.py` 既有的 `app_root()`(開發模式回傳專案根目錄,frozen 模式回傳
+`sys._MEIPASS`),跟 `icon_path()` 是同一套機制。`NeonSweep.spec` 的 `datas` 已加入
+`third_party/smartmontools` 整個資料夾——**打包前這個資料夾必須實際存在**(可以是空的,
+但資料夾本身不能沒建立,否則 PyInstaller 在 `Analysis()` 階段就會直接報錯)。
+
+### 13.2 行為
+
+- `smart_health.is_available()`:偵測 `smartctl.exe` 是否存在。不存在時 `HealthPage` 顯示
+  下載提示,「開始診斷」按鈕停用,不影響軟體其他功能。
+- `scan_devices()`:呼叫 `smartctl --scan-open -j` 列出所有偵測到的實體磁碟。
+- `query_health(device, dev_type)`:呼叫 `smartctl -a -j <device>` 取得 JSON,依磁碟類型
+  抽取關鍵指標——SATA/HDD 看 SMART attribute ID 5(已重新對應磁區)/197(待處理磁區)/
+  198(無法修正錯誤數);NVMe 看 `percentage_used`(耗損百分比)/`media_errors`。查詢失敗
+  (權限不足、裝置忙碌、控制器不支援)一律回傳 `None`,UI 顯示「未知」而非誤導使用者。
+- `query_health_text(device, dev_type)`:回傳 `smartctl -a` 純文字報告,供「詳細報告」
+  對話框顯示完整原始輸出。
+- 讀取實體磁碟(`\\.\PhysicalDriveN`)在多數環境下需要系統管理員權限;非管理員模式下
+  查詢失敗時,`HealthPage` 會提示「可能需要以系統管理員身分重新啟動」,不會假裝成功。
+
+### 13.3 刻意不做的項目
+
+- 不提供「修復壞軌」「隔離壞磁區」等功能——這些操作風險極高,不是這套工具的定位。
+- 不自己解析原始 ATA/NVMe SMART 位元組(不透過 ctypes 直接發 IOCTL)——相容性資料庫
+  太龐大,交給 smartmontools 處理。
+- 不因為健康狀態異常就自動跳出「請立刻更換硬碟」之類的強烈警語彈窗——只在頁面上如實
+  顯示數字與狀態,判斷交給使用者。

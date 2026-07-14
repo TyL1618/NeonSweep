@@ -22,6 +22,7 @@ from .clean_page import CleanPage
 from .devspace_page import DevSpacePage
 from .diagnostic_page import DiagnosticPage
 from .dupe_page import DupePage
+from .health_page import HealthPage
 
 NAV_ITEMS = [
     ("clean", "⚡", "清理"),
@@ -29,6 +30,7 @@ NAV_ITEMS = [
     ("dupe", "⧉", "重複檔案"),
     ("devspace", "⌘", "開發空間"),
     ("diagnostic", "🩺", "系統診斷"),
+    ("health", "💚", "磁碟健康"),
 ]
 
 
@@ -65,6 +67,7 @@ class MainWindow(QMainWindow):
         self._dupe_page = DupePage()
         self._devspace_page = DevSpacePage()
         self._diagnostic_page = DiagnosticPage()
+        self._health_page = HealthPage()
 
         self._pages = {
             "clean": self._clean_page,
@@ -72,6 +75,7 @@ class MainWindow(QMainWindow):
             "dupe": self._dupe_page,
             "devspace": self._devspace_page,
             "diagnostic": self._diagnostic_page,
+            "health": self._health_page,
         }
         for page in self._pages.values():
             self._stack.addWidget(page)

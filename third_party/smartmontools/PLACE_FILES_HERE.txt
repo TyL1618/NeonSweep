@@ -1,0 +1,18 @@
+此資料夾故意留空(不隨 git 版控)。
+
+磁碟健康診斷功能(cleaner/smart_health.py、cleaner/views/health_page.py)需要下列檔案:
+
+  - smartctl.exe
+  - drivedb.h
+
+請自行從官方網站下載 Windows 版本的 smartmontools:
+  https://www.smartmontools.org
+
+解壓縮後把上述兩個檔案直接放進這個資料夾(third_party/smartmontools/),
+同時建議把壓縮包內附的 LICENSE(GPLv2)也一併複製過來、命名為 LICENSE.txt,
+供日後打包散布時附上授權聲明用。
+
+完整說明見專案根目錄 DEVDOC.md 的「§13 磁碟健康診斷」章節。
+
+放好檔案後,重新啟動 NeonSweep,側邊欄「磁碟健康」頁籤即可使用;
+若要打包成 exe,PyInstaller 也會把這個資料夾一併包進去(見 NeonSweep.spec 的 datas)。
