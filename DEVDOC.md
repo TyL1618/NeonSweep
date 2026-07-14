@@ -747,9 +747,23 @@ third_party/smartmontools/
 `third_party/smartmontools/PLACE_FILES_HERE.txt`。
 
 路徑解析用 `utils/fs.py` 既有的 `app_root()`(開發模式回傳專案根目錄,frozen 模式回傳
-`sys._MEIPASS`),跟 `icon_path()` 是同一套機制。`NeonSweep.spec` 的 `datas` 已加入
-`third_party/smartmontools` 整個資料夾——**打包前這個資料夾必須實際存在**(可以是空的,
-但資料夾本身不能沒建立,否則 PyInstaller 在 `Analysis()` 階段就會直接報錯)。
+`sys._MEIPASS`),跟 `icon_path()` 是同一套機制。
+
+**踩過的雷,別再犯**:`NeonSweep.spec` 的 `datas` 一開始寫成
+`('third_party/smartmontools', 'third_party/smartmontools')`——直接指一整個資料夾路徑。
+**實測證實這樣不會遞迴展開資料夾內容**,打包出來的 onefile exe 解壓後 `_MEIPASS` 裡完全
+沒有這個資料夾,`smartctl.exe` 從來沒有真的被包進去過。這個 bug 曾一度誤導成「防毒軟體
+對內嵌的原生磁碟工具做深度掃描,導致啟動變慢」的錯誤方向,浪費了不少排查時間——當時
+觀察到的啟動延遲確實是防毒軟體造成的(用「關掉防毒 vs 開著防毒」連續啟動計時驗證過,
+差異非常明顯),但延遲的觸發原因不會是 `smartctl.exe`,因為它根本不在封裝檔裡;比較
+可能是防毒軟體對「未簽章、剛建置出來的大型 onefile exe」本身的一般性反應。
+
+現在改成在 `smart_health.py` 上方的 `_SMARTCTL_FILES` 清單裡**逐一列出檔名**,用
+`(source_file, dest_dir)` 的個別檔案 tuple 加進 `datas`——這是官方文件明確支援、不會
+有歧義的寫法。驗證方式:打包後不要只看 build log,**要實際執行一次、趁程序還活著時去看
+`%TEMP%\_MEI*\third_party\smartmontools\` 底下有沒有東西**,這是唯一可信的驗證方法
+(對編譯後的封裝檔做 grep 找字串不可靠——UPX 壓縮跟 CArchive 內部的 zlib 壓縮都會讓
+明碼字串消失,即使檔案真的有包進去也一樣搜不到,這個誤判也發生過一次)。
 
 ### 13.2 行為
 
@@ -772,3 +786,23 @@ third_party/smartmontools/
   太龐大,交給 smartmontools 處理。
 - 不因為健康狀態異常就自動跳出「請立刻更換硬碟」之類的強烈警語彈窗——只在頁面上如實
   顯示數字與狀態,判斷交給使用者。
+
+### 13.4 啟動畫面(`splash.png` / `NeonSweep.spec` 的 `Splash()`)
+
+onefile 打包的 exe,不管有沒有內嵌 smartctl.exe,本身就會因為要在啟動時解壓縮而有幾秒
+延遲(遇到防毒軟體對未簽章執行檔的一般性檢查時,延遲可能更明顯)。加這個純粹是為了讓
+使用者在等待期間知道「程式正在啟動、不是點了沒反應」,跟磁碟健康本身沒有直接關係。
+
+- `scripts/gen_splash.py`:用 PIL 產生 480×280 的 `splash.png`(黑底、粉藍漸層圓環 +
+  「NeonSweep」標題 + 副標題),風格對齊 `scripts/gen_icon.py` 的圖示配色。只在需要重新
+  產生圖片時手動執行。
+- `NeonSweep.spec` 用 PyInstaller 的 `Splash()` 機制:這張圖會在 bootloader 解壓縮階段
+  就顯示(比 Python 直譯器啟動還早),`text_pos`/`text_color`/`text_default` 疊一行「啟動
+  中…」文字。**這個機制內部依賴 Tcl/Tk**,所以 `excludes` 不能再排除 `tkinter`,即使
+  本專案完全不 import 它。
+- `main.py` 在 `MainWindow` 顯示後呼叫 `pyi_splash.close()` 關掉啟動畫面。`pyi_splash`
+  只在 frozen + 有搭配 `Splash()` 打包時才存在,開發模式下用 `try/except ImportError`
+  吞掉,不影響 `python main.py` 直接執行。
+- 這只能讓使用者知道「正在啟動、沒當掉」,不會讓啟動真的變快;如果延遲來源是防毒軟體
+  攔截在「exe 連第一行程式碼都還沒被允許執行」的層級,連 Splash 都不會比它更早顯示。
+  這種情況下沒有應用層級的解法,只能考慮日後幫 exe 做程式碼簽章。

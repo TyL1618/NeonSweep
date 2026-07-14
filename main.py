@@ -17,6 +17,16 @@ def main() -> None:
     window = MainWindow()
     window.show()
 
+    # 關掉 PyInstaller onefile 打包的啟動畫面(見 NeonSweep.spec 的 Splash())。
+    # pyi_splash 只在有搭配 Splash() 打包的 frozen exe 裡才存在,開發模式下 import 會
+    # 失敗,屬預期行為。
+    try:
+        import pyi_splash
+
+        pyi_splash.close()
+    except ImportError:
+        pass
+
     sys.exit(app.exec())
 
 
