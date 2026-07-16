@@ -43,6 +43,8 @@ a = Analysis(
         'cleaner.report',
         'cleaner.workers',
         'cleaner.analysis',
+        'cleaner.treemap',
+        'cleaner.similarity',
         'cleaner.diagnostics',
         'cleaner.smart_health',
         'cleaner.utils',
@@ -70,9 +72,15 @@ a = Analysis(
         'cleaner.views.clean_page',
         'cleaner.views.bigfile_page',
         'cleaner.views.dupe_page',
+        'cleaner.views.similarity_page',
+        'cleaner.views.treemap_page',
         'cleaner.views.devspace_page',
         'cleaner.views.diagnostic_page',
         'cleaner.views.health_page',
+        # 相似檔案頁面用 opencv;numpy 為其相依。PyInstaller 內建 hook-cv2 會收集 cv2 的 binary,
+        # 這裡明確列出確保凍結後不漏。注意下方 excludes 已不再排除 numpy。
+        'cv2',
+        'numpy',
         # send2trash 的 Windows 後端是條件式 import,明確列出避免凍結後漏打包
         'send2trash',
         'send2trash.win',
@@ -92,8 +100,8 @@ a = Analysis(
         # 不需要的大型套件(僅 scripts/gen_icon.py、scripts/gen_splash.py 這種開發期工具
         # 會用到 PIL,執行期不需要)。注意:tkinter 不能排除——下面的 Splash() 啟動畫面
         # 機制內部依賴 PyInstaller 自帶的 Tcl/Tk 執行期,即使程式本身完全不 import tkinter。
+        # numpy 不能排除——相似檔案頁面的 opencv 相依 numpy(移除排除後 exe 會變大約 +80~120MB)。
         'matplotlib',
-        'numpy',
         'pandas',
         'PIL',
         'scipy',

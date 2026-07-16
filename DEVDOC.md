@@ -522,7 +522,7 @@ def atime_reliable(drive_root: str) -> bool:
 
 使用場景:使用者的 2TB HDD 存大量影片/照片,常發生同一檔案重複下載、只是檔名不同(`video_A.mp4` vs `video_A (2).mp4`)。偵測靠**內容雜湊**,與檔名完全無關。
 
-**範圍限制(寫給實作者):只偵測位元組完全相同的檔案。** 不做感知雜湊(perceptual hash)、不做「相似但重新編碼」的影片比對——那需要 ffmpeg 解碼且有誤判風險,明確排除在範圍外,不要嘗試實作。
+**範圍限制(寫給實作者):這個頁面只偵測位元組完全相同的檔案。** 不在本頁做感知雜湊(perceptual hash)、不在本頁做「相似但重新編碼」的影片比對——本頁刻意維持「有就是有、沒有就是沒有」的絕對正確性(零誤判)。感知式的相似比對(縮放/轉檔/剪輯)另外做在獨立的「相似檔案」頁面(§8.6),兩者定位不同、刻意分離,不要把感知雜湊塞進本頁。
 
 **掃描選項列:**
 - 磁碟選擇 chips(§2)之外,加**檔案類型 chips**:`全部` `影片` `圖片` `音訊`(可複選,預設全部)。副檔名:影片同 §8.1 表;圖片 `.jpg .jpeg .png .gif .webp .bmp .heic .tif .tiff`;音訊 `.mp3 .flac .wav .m4a .ogg`。選了類型就只掃該類副檔名,大幅縮短整碟掃描時間。
@@ -570,6 +570,32 @@ def atime_reliable(drive_root: str) -> bool:
 - WinSxS/DriverStore 用 `safe_walk` 遞迴加總,權限錯誤時 `complete=False`,UI 顯示「部分項目因權限被略過,僅供參考」而非假裝精確。
 - `vssadmin` 輸出的文字標籤會隨系統語系不同,**不比對標籤字串**,改用正規表示式 `([\d.]+)\s*(TB|GB|MB|KB|B)\s*\((\d+)%\)` 抓「數字+單位+百分比」格式,固定取第一筆(Used,vssadmin 固定先印 Used 再印 Allocated/Maximum)。失敗(非管理員、`vssadmin` 不存在、逾時)一律回傳 `None`,UI 顯示「無法讀取(可能需要管理員權限)」。
 - 五個類別依序查詢(非平行),前兩個是耗時的目錄樹掃描、有進度回報,後三個是單一系統呼叫、即查即回。
+
+### 8.6 相似圖片/影片偵測(`similarity_page.py` / `similarity.py`)— 感知雜湊,使用者後續要求新增
+
+與 §8.3 重複檔案(位元組完全相同)**刻意分離**:本頁用感知雜湊做**機率性**相似判斷,天生會有誤判,故 UI 一律呈現候選 + 縮圖 +(影片)相似片段,刪除決定權在使用者。純邏輯層 `similarity.py` 不碰 Qt(比照 `analysis.py`);Qt 層在 `workers.SimilarityWorker`。
+
+**依賴:opencv-python**(numpy 隨之)。`workers.SimilarityWorker.run()` **延遲載入** `cleaner.similarity`(其頂層 `import cv2`),沒裝 opencv 的環境仍能啟動 App、其餘功能照常,只有本頁掃描會 emit `error` 回報。**打包關鍵**:`NeonSweep.spec` 的 `excludes` 原本排除 `numpy`,加入本功能後**必須移除該排除**並在 `hiddenimports` 加 `cv2`、`numpy`,否則 frozen exe 內相似偵測會壞掉;代價是 exe 體積約 +80~120MB(見 `NeonSweep.spec` 與 `requirements.txt` 註解)。
+
+**指紋:dHash。** 灰階 → resize 9×8 → 相鄰像素亮度差 → 64-bit。圖片走 `cv2.imdecode(np.fromfile(path))` 而非 `cv2.imread`(後者對 Windows 非 ASCII 路徑會失敗)。
+
+- **圖片** `find_similar_images`:`safe_walk` 收 `IMAGE_EXTS` → 算 dHash → 兩兩 Hamming 距離 ≤ 門檻用 Union-Find 遞移合併成群。pairwise 是 O(n²),但用 numpy 向量化 popcount(`np.unpackbits`)加速。**抓得到**縮放/轉檔/重壓縮/亮度微調;**抓不到**裁切/局部塗改/浮水印遮蓋(那要 ORB/SIFT 局部特徵匹配,明確不在範圍)。
+- **影片** `find_similar_videos`:`cv2.VideoCapture` 按**時間點**(`CAP_PROP_POS_MSEC`,每 `VIDEO_INTERVAL_SEC` 秒,上限 `VIDEO_MAX_SAMPLES` 幀)取樣算 dHash → 指紋序列(故不受 FPS 差異影響)。非 ASCII 路徑後援:`GetShortPathNameW` 取 8.3 短路徑重試。兩片指紋序列用 **Smith-Waterman 區域比對**(`_local_align`)找最相似的連續片段,允許 gap → 同時處理掐頭去尾與抽掉中段的剪輯。`min_match_len`(最短連續相似取樣點)過濾黑畫面/共用片頭的巧合匹配。效能:先用向量化 match 矩陣做便宜初篩(共享畫面數不足就跳過昂貴的 Python DP),只有可能重疊的配對才跑 Smith-Waterman。
+- 設定列:類型 chips(圖片/影片,**單選**)+ 相似程度下拉(寬鬆/標準/嚴格,對映圖片 Hamming 門檻與影片 `min_match_len`)+ 磁碟/資料夾範圍(見 §8.7 註)。
+- 結果 UI 沿用 §8.3 骨架:QTreeWidget 分群 + `QPixmap` 縮圖預覽(影片只顯示中繼資料)+ checkbox + 「保留最舊/最新」+ 防呆「每組至少保留一個」+ `send2trash` 刪除。影片群另把相似片段區間掛成不可勾選的說明列(`↳ A 00:32–04:18 ≈ B 01:05–04:51`)。
+- **不做指紋快取**(每次掃描重算)——列為後續可加強項。
+
+### 8.7 空間視覺化 Treemap(`treemap_page.py` / `treemap.py`)— 純檢視,零刪除,使用者後續要求新增
+
+補足 §8.1 大檔案掃描抓不到「一堆小檔案加起來很肥的資料夾」的盲點,用 WinDirStat 式 treemap 以**面積**呈現佔用。純邏輯層 `treemap.py` 不碰 Qt;Qt 層在 `workers.TreeSizeWorker` + 自訂 `QPainter` 繪圖 widget `TreemapView`。零新依賴。
+
+- `build_size_tree(targets)`:遞迴 `os.scandir`(安全性比照 `safe_walk`:不進 reparse point、命中 `EXCLUDED_DIRS` 不下探、OSError 跳過),但**保留階層結構**;資料夾 size = 子節點加總(bottom-up)。Node 為 dict `{path,name,size,is_dir,children,aggregate?}`。
+- `top_children(node, limit)`:只取前 limit 大的子節點,其餘併成「其他 N 項」聚合節點,避免對含數萬檔案的資料夾一次鋪出數萬個小矩形。
+- `squarify(nodes, rect)`:Squarified treemap(Bruls et al. 2000),同層依 size 遞迴切割矩形、盡量正方形。**只鋪當前層級一層**,下鑽時對子樹重算,不預先鋪整棵樹。
+- `TreemapView`:`paintEvent` 逐塊 `fillRect` + 標籤,顏色複用 `analysis.classify` 的類型分類(資料夾另有專色);左鍵點資料夾**下鑽**、頂部麵包屑回上層、hover 顯示完整路徑 + 大小、右鍵「開啟位置」。**不提供刪除**(純檢視,要刪去 §8.1/§8.3)。
+- 記憶體:整碟掃描會把整棵樹留在記憶體,節點多時較吃記憶體——靠「指定資料夾範圍」(§8.7 註)縮小是主要的壓力釋放閥。
+
+> **§8 共用:掃描範圍不限整碟(`views/common.py::FolderPicker`)。** dupe/bigfile/treemap/similarity 四個掃描頁都可用磁碟 chips 之外的 `FolderPicker` 指定任意資料夾(含子目錄)當掃描根,清單非空時改掃指定資料夾、否則掃勾選磁碟。底層 `safe_walk` / `build_size_tree` 對「磁碟根」或「任意資料夾路徑」一視同仁,故只是 UI 傳不同的 `targets: list[str]`。注意 bigfile 的 atime 可靠性查表要用**磁碟代號**還原(`targets` 可能是子資料夾),見 `bigfile_page._start_scan`。
 
 ---
 
@@ -715,6 +741,12 @@ PyInstaller `--noconsole --onefile`,manifest 維持 asInvoker,附 icon。
 - [ ] 刪除前驗證:掃描後改動某檔案內容再執行刪除 → 該檔被拒刪並回報
 - [ ] 清理完成後磁碟燈條數字有更新
 - [ ] 視窗在清理中直接關閉 → 執行緒正常收尾,無崩潰訊息
+- [ ] 掃描範圍:dupe/bigfile/treemap/similarity 加一個資料夾後只掃該資料夾樹,不加則掃勾選磁碟
+- [ ] 空間圖:掃一個資料夾 → 方塊面積比例正確、點資料夾可下鑽、麵包屑可回上層、hover 顯示路徑
+- [ ] 相似圖片:同一張圖的原圖 + 縮放版 + 重壓縮版被歸為同一群;不相干圖片不誤入
+- [ ] 相似影片:同一部影片不同解析度/FPS + 剪掉頭尾的版本被歸為同一群,並顯示相似片段區間
+- [ ] 相似檔案頁:每組全勾時刪除鈕 disabled(沿用重複檔案頁防呆)
+- [ ] 打包後 exe:相似偵測頁能實際讀圖/解影片(確認 cv2 有打包進 onefile)
 
 ---
 

@@ -5,13 +5,10 @@ from PyQt6.QtCore import QThread, Qt
 from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -26,7 +23,7 @@ from .. import analysis, theme
 from ..utils.fs import display_path, format_size, list_drives
 from ..widgets.neon_progress import NeonProgressBar
 from ..workers import BigFileWorker
-from .common import HUGE_FILE_THRESHOLD, ChipRow, confirm_delete, safe_trash_delete
+from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, safe_trash_delete
 
 PATH_ELIDE_WIDTH = 480
 
@@ -92,29 +89,10 @@ class BigFilePage(QWidget):
         )
         layout.addWidget(self._drive_chips)
 
-        folder_hint = QLabel("指定資料夾範圍(可選):新增後會改成只掃描這些資料夾(含子目錄),不新增則掃描上方勾選的磁碟")
-        folder_hint.setStyleSheet(f"color: {theme.TEXT_DIM};")
-        folder_hint.setWordWrap(True)
-        layout.addWidget(folder_hint)
-
-        folder_btn_row = QHBoxLayout()
-        add_folder_btn = QPushButton("+ 新增資料夾")
-        add_folder_btn.clicked.connect(self._add_folder)
-        remove_folder_btn = QPushButton("移除選取")
-        remove_folder_btn.clicked.connect(self._remove_selected_folder)
-        folder_btn_row.addWidget(add_folder_btn)
-        folder_btn_row.addWidget(remove_folder_btn)
-        folder_btn_row.addStretch(1)
-        layout.addLayout(folder_btn_row)
-
-        self._folder_list = QListWidget()
-        self._folder_list.setMaximumHeight(90)
-        self._folder_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self._folder_list.setStyleSheet(
-            f"background-color: {theme.BG_PANEL}; color: {theme.TEXT_MAIN}; "
-            f"font-family: Consolas; font-size: 9pt; border: 1px solid {theme.TEXT_DIM};"
+        self._folder_picker = FolderPicker(
+            hint="指定資料夾範圍(可選):新增後會改成只掃描這些資料夾(含子目錄),不新增則掃描上方勾選的磁碟"
         )
-        layout.addWidget(self._folder_list)
+        layout.addWidget(self._folder_picker)
 
         layout.addStretch(1)
 
@@ -168,27 +146,8 @@ class BigFilePage(QWidget):
 
         return page
 
-    def _add_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
-        if not folder:
-            return
-        folder = os.path.normpath(folder)
-        if folder in self._selected_folders():
-            return
-        item = QListWidgetItem(display_path(folder))
-        item.setData(Qt.ItemDataRole.UserRole, folder)
-        item.setToolTip(folder)
-        self._folder_list.addItem(item)
-
-    def _remove_selected_folder(self) -> None:
-        for item in self._folder_list.selectedItems():
-            self._folder_list.takeItem(self._folder_list.row(item))
-
-    def _selected_folders(self) -> list[str]:
-        return [self._folder_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self._folder_list.count())]
-
     def _start_scan(self) -> None:
-        folders = self._selected_folders()
+        folders = self._folder_picker.selected_folders()
         targets = folders if folders else self._drive_chips.checked_keys()
         if not targets:
             return

@@ -1,6 +1,6 @@
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from . import analysis, diagnostics, smart_health
+from . import analysis, diagnostics, smart_health, treemap
 from .modules.base import ScanCancelled
 
 
@@ -167,6 +167,80 @@ class DevSpaceWorker(QObject):
             progress_cb=lambda path: self.progress.emit(path),
             cancel_check=lambda: self._cancelled,
         )
+        self.finished.emit(result)
+
+
+class TreeSizeWorker(QObject):
+    """空間視覺化:遞迴建立資料夾大小樹(treemap.build_size_tree)。"""
+
+    progress = pyqtSignal(int, str)   # scanned_count, current_path
+    finished = pyqtSignal(object)     # 根節點 dict(取消時為 None)
+
+    def __init__(self, targets: list[str]):
+        super().__init__()
+        self._targets = targets
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self):
+        result = treemap.build_size_tree(
+            self._targets,
+            progress_cb=lambda count, path: self.progress.emit(count, path),
+            cancel_check=lambda: self._cancelled,
+        )
+        self.finished.emit(result)
+
+
+class SimilarityWorker(QObject):
+    """相似圖片/影片偵測(感知雜湊)。opencv 只在 run() 內延遲載入,讓沒裝 opencv 的環境
+    仍能啟動 App、其餘功能照常,只有這個掃描會回報錯誤。
+    """
+
+    progress = pyqtSignal(int, int, int, str)   # phase, done, total, current_path
+    finished = pyqtSignal(list)                 # list[dict]:{"paths","segments","kind"}
+    error = pyqtSignal(str)
+
+    def __init__(self, targets: list[str], mode: str, threshold: int, min_match_len: int):
+        super().__init__()
+        self._targets = targets
+        self._mode = mode                       # "image" | "video"
+        self._threshold = threshold             # 圖片 Hamming 門檻
+        self._min_match_len = min_match_len     # 影片最短相似片段
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self):
+        try:
+            from . import similarity
+        except Exception as e:  # opencv / numpy 缺失或載入失敗
+            self.error.emit(f"無法載入影像處理套件(opencv-python):{e}")
+            self.finished.emit([])
+            return
+
+        emit = lambda phase, done, total, path: self.progress.emit(phase, done, total, path)
+        cancel = lambda: self._cancelled
+        if self._mode == "video":
+            raw = similarity.find_similar_videos(
+                self._targets, min_match_len=self._min_match_len, progress_cb=emit, cancel_check=cancel
+            )
+            result = [{"paths": d["paths"], "segments": d["segments"], "kind": "video"} for d in raw]
+        else:
+            raw = similarity.find_similar_images(
+                self._targets, threshold=self._threshold, progress_cb=emit, cancel_check=cancel
+            )
+            result = [{"paths": g, "segments": [], "kind": "image"} for g in raw]
         self.finished.emit(result)
 
 

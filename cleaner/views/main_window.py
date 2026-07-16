@@ -23,11 +23,15 @@ from .devspace_page import DevSpacePage
 from .diagnostic_page import DiagnosticPage
 from .dupe_page import DupePage
 from .health_page import HealthPage
+from .similarity_page import SimilarityPage
+from .treemap_page import TreemapPage
 
 NAV_ITEMS = [
     ("clean", "⚡", "清理"),
     ("bigfile", "📦", "大檔案"),
     ("dupe", "⧉", "重複檔案"),
+    ("similar", "🔍", "相似檔案"),
+    ("treemap", "🗺", "空間圖"),
     ("devspace", "⌘", "開發空間"),
     ("diagnostic", "🩺", "系統診斷"),
     ("health", "💚", "磁碟健康"),
@@ -65,6 +69,8 @@ class MainWindow(QMainWindow):
         self._clean_page = CleanPage()
         self._bigfile_page = BigFilePage()
         self._dupe_page = DupePage()
+        self._similarity_page = SimilarityPage()
+        self._treemap_page = TreemapPage()
         self._devspace_page = DevSpacePage()
         self._diagnostic_page = DiagnosticPage()
         self._health_page = HealthPage()
@@ -73,6 +79,8 @@ class MainWindow(QMainWindow):
             "clean": self._clean_page,
             "bigfile": self._bigfile_page,
             "dupe": self._dupe_page,
+            "similar": self._similarity_page,
+            "treemap": self._treemap_page,
             "devspace": self._devspace_page,
             "diagnostic": self._diagnostic_page,
             "health": self._health_page,

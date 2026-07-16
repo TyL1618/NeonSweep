@@ -6,10 +6,22 @@ send2trash 安全刪除(含刪前重新驗證)、確認對話框。不屬於 DEV
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QButtonGroup, QHBoxLayout, QMessageBox, QPushButton, QWidget
+from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 from send2trash import send2trash
 
 from .. import theme
+from ..utils.fs import display_path
 
 HUGE_FILE_THRESHOLD = 10 * 1024**3  # 10 GB,見 DEVDOC §5 規則 7
 
@@ -79,6 +91,65 @@ class ChipRow(QWidget):
 
     def chip(self, key: str) -> NeonChip:
         return self._chips[key]
+
+
+class FolderPicker(QWidget):
+    """磁碟 chips 之外的「指定資料夾範圍」選擇器:一顆新增鈕開檔案對話框、一顆移除鈕、
+    一個路徑清單。四個掃描頁(dupe/bigfile/treemap/similarity)共用,避免各自複製。
+
+    selected_folders() 回傳使用者已加入的資料夾(原始反斜線路徑);清單為空代表沒有縮小
+    範圍,由呼叫端自行決定改用磁碟 chips。
+    """
+
+    def __init__(self, parent=None, hint: str | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        if hint:
+            lbl = QLabel(hint)
+            lbl.setStyleSheet(f"color: {theme.TEXT_DIM};")
+            lbl.setWordWrap(True)
+            layout.addWidget(lbl)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ 新增資料夾")
+        add_btn.clicked.connect(self._add)
+        remove_btn = QPushButton("移除選取")
+        remove_btn.clicked.connect(self._remove)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self._list = QListWidget()
+        self._list.setMaximumHeight(90)
+        self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._list.setStyleSheet(
+            f"background-color: {theme.BG_PANEL}; color: {theme.TEXT_MAIN}; "
+            f"font-family: Consolas; font-size: 9pt; border: 1px solid {theme.TEXT_DIM};"
+        )
+        layout.addWidget(self._list)
+
+    def _add(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if folder in self.selected_folders():
+            return
+        item = QListWidgetItem(display_path(folder))
+        item.setData(Qt.ItemDataRole.UserRole, folder)
+        item.setToolTip(folder)
+        self._list.addItem(item)
+
+    def _remove(self) -> None:
+        for item in self._list.selectedItems():
+            self._list.takeItem(self._list.row(item))
+
+    def selected_folders(self) -> list[str]:
+        return [self._list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self._list.count())]
 
 
 def confirm_delete(parent, title: str, message: str, huge_file: bool = False) -> bool:

@@ -1,3 +1,7 @@
+"""相似圖片/影片偵測頁面。與「重複檔案」(位元組完全相同)刻意分離:這裡用感知雜湊做
+機率性相似判斷,會有誤判,故 UI 一律呈現候選 + 縮圖 + (影片)相似片段,由使用者人工複核後刪除。
+"""
+
 import os
 import subprocess
 
@@ -23,29 +27,26 @@ from PyQt6.QtWidgets import (
 from .. import analysis, theme
 from ..utils.fs import display_path, format_size, list_drives
 from ..widgets.neon_progress import NeonProgressBar
-from ..workers import DupeWorker
+from ..workers import SimilarityWorker
 from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, safe_trash_delete
 
 PATH_ELIDE_WIDTH = 480
-MIN_SIZE_OPTIONS = [("500 KB", 500 * 1024), ("1 MB", 1024 * 1024), ("10 MB", 10 * 1024 * 1024), ("100 MB", 100 * 1024 * 1024)]
-TYPE_FILTERS = [
-    ("all", "全部"),
-    ("video", "影片"),
-    ("image", "圖片"),
-    ("audio", "音訊"),
+TYPE_FILTERS = [("image", "圖片"), ("video", "影片")]
+# (標籤, 圖片 Hamming 門檻, 影片最短相似片段秒數)
+STRICTNESS_OPTIONS = [
+    ("寬鬆(找比較多,誤判也較多)", 14, 12),
+    ("標準", 10, 20),
+    ("嚴格(只找非常像的)", 6, 30),
 ]
 
 
-class DupePage(QWidget):
-    """重複檔案偵測(DEVDOC §8.3):三階段漏斗(大小分組 -> 前4KB快速雜湊 -> 全檔雜湊)。
-    僅偵測位元組完全相同的檔案,不做感知雜湊/影片重編碼比對。
-    """
-
+class SimilarityPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._thread = None
         self._worker = None
-        self._groups: list[list[dict]] = []  # each: {path, size, mtime}
+        self._groups: list[list[dict]] = []
+        self._group_segments: list[list[str]] = []
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -59,23 +60,39 @@ class DupePage(QWidget):
             self._stack.addWidget(p)
         self._stack.setCurrentWidget(self._setup_page)
 
-    # ------------------------------------------------------------------
-    # SETUP
-    # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------------ SETUP
     def _build_setup_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(32, 24, 32, 24)
         layout.setSpacing(14)
 
-        title = QLabel("重複檔案偵測")
+        title = QLabel("相似圖片/影片偵測")
         title.setStyleSheet(f"color: {theme.TEXT_MAIN}; font-size: 14pt; font-weight: bold;")
         layout.addWidget(title)
 
-        hint = QLabel("只偵測位元組完全相同的檔案,與檔名無關")
+        hint = QLabel(
+            "用感知雜湊找「內容相似」的檔案(縮放、轉檔、重壓縮、不同畫質/FPS、剪輯過的影片)。"
+            "會有誤判,結果僅供人工複核;抓不到裁切或加塗鴉的圖片。"
+        )
         hint.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        hint.setWordWrap(True)
         layout.addWidget(hint)
+
+        self._type_chips = ChipRow(items=TYPE_FILTERS, default_checked={"image"}, exclusive=True)
+        layout.addWidget(self._type_chips)
+
+        strict_row = QHBoxLayout()
+        strict_label = QLabel("相似程度:")
+        strict_label.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        self._strict_combo = QComboBox()
+        for label, _t, _m in STRICTNESS_OPTIONS:
+            self._strict_combo.addItem(label)
+        self._strict_combo.setCurrentIndex(1)  # 標準
+        strict_row.addWidget(strict_label)
+        strict_row.addWidget(self._strict_combo)
+        strict_row.addStretch(1)
+        layout.addLayout(strict_row)
 
         sysdrive = os.environ.get("SystemDrive", "C:").upper() + "\\"
         drives = list_drives()
@@ -83,24 +100,10 @@ class DupePage(QWidget):
         layout.addWidget(self._drive_chips)
 
         self._folder_picker = FolderPicker(
-            hint="指定資料夾範圍(可選):新增後會改成只掃描這些資料夾(含子目錄),不新增則掃描上方勾選的磁碟"
+            hint="指定資料夾範圍(可選):新增後只掃描這些資料夾(含子目錄),不新增則掃描上方勾選的磁碟。"
+            "影片解碼取樣很耗時,強烈建議縮小到想比對的資料夾。"
         )
         layout.addWidget(self._folder_picker)
-
-        self._type_chips = ChipRow(items=TYPE_FILTERS, default_checked={"all"})
-        layout.addWidget(self._type_chips)
-
-        size_row = QHBoxLayout()
-        size_label = QLabel("最小檔案門檻:")
-        size_label.setStyleSheet(f"color: {theme.TEXT_DIM};")
-        self._min_size_combo = QComboBox()
-        for label, _value in MIN_SIZE_OPTIONS:
-            self._min_size_combo.addItem(label)
-        self._min_size_combo.setCurrentIndex(1)  # 1 MB 預設
-        size_row.addWidget(size_label)
-        size_row.addWidget(self._min_size_combo)
-        size_row.addStretch(1)
-        layout.addLayout(size_row)
 
         layout.addStretch(1)
 
@@ -116,13 +119,9 @@ class DupePage(QWidget):
         row.addStretch(1)
         layout.addLayout(row)
         layout.addStretch(2)
-
         return page
 
-    # ------------------------------------------------------------------
-    # SCANNING
-    # ------------------------------------------------------------------
-
+    # -------------------------------------------------------------- SCANNING
     def _build_scanning_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -134,8 +133,8 @@ class DupePage(QWidget):
         self._phase_label.setStyleSheet(f"color: {theme.TEXT_MAIN}; font-family: Consolas;")
         layout.addWidget(self._phase_label)
 
-        self._dupe_progress_bar = NeonProgressBar()
-        layout.addWidget(self._dupe_progress_bar)
+        self._progress_bar = NeonProgressBar()
+        layout.addWidget(self._progress_bar)
 
         self._phase_path_label = QLabel("")
         self._phase_path_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -150,73 +149,9 @@ class DupePage(QWidget):
         row.addStretch(1)
         layout.addLayout(row)
         layout.addStretch(1)
-
         return page
 
-    def _selected_extensions(self) -> set | None:
-        keys = self._type_chips.checked_keys()
-        if not keys or "all" in keys:
-            return None
-        mapping = {"video": analysis.VIDEO_EXTS, "image": analysis.IMAGE_EXTS, "audio": analysis.AUDIO_EXTS}
-        exts: set = set()
-        for k in keys:
-            exts |= mapping.get(k, set())
-        return exts or None
-
-    def _start_scan(self) -> None:
-        folders = self._folder_picker.selected_folders()
-        targets = folders if folders else self._drive_chips.checked_keys()
-        if not targets:
-            return
-        extensions = self._selected_extensions()
-        min_size = MIN_SIZE_OPTIONS[self._min_size_combo.currentIndex()][1]
-
-        self._phase_label.setText("第 1/3 階段:比對檔案大小(已掃 0 檔)")
-        self._dupe_progress_bar.set_indeterminate(True)
-        self._phase_path_label.setText("")
-        self._stack.setCurrentWidget(self._scanning_page)
-
-        self._thread = QThread(self)
-        self._worker = DupeWorker(targets, extensions, min_size)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_scan_finished)
-        self._thread.start()
-
-    def _cancel_scan(self) -> None:
-        if self._worker:
-            self._worker.cancel()
-
-    def _on_progress(self, phase: int, done: int, total: int, path: str) -> None:
-        metrics = QFontMetrics(self._phase_path_label.font())
-        elided = metrics.elidedText(path, Qt.TextElideMode.ElideMiddle, PATH_ELIDE_WIDTH)
-        self._phase_path_label.setText(elided)
-        if phase == 1:
-            self._phase_label.setText(f"第 1/3 階段:比對檔案大小(已掃 {done} 檔)")
-            self._dupe_progress_bar.set_indeterminate(True)
-        elif phase == 2:
-            self._phase_label.setText(f"第 2/3 階段:快速比對({total} 檔候選,已處理 {done})")
-            self._dupe_progress_bar.set_indeterminate(True)
-        else:
-            self._phase_label.setText(f"第 3/3 階段:完整雜湊(第 {done}/{total} 檔)")
-            self._dupe_progress_bar.set_indeterminate(False)
-            if total:
-                self._dupe_progress_bar.setValue(min(int(done / total * 100), 100))
-
-    def shutdown(self) -> None:
-        if self._worker:
-            self._worker.cancel()
-        if self._thread:
-            self._thread.wait(2000)
-
-    # ------------------------------------------------------------------
-    # RESULTS
-    # ------------------------------------------------------------------
-
+    # --------------------------------------------------------------- RESULTS
     def _build_results_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -224,11 +159,12 @@ class DupePage(QWidget):
         layout.setSpacing(8)
 
         self._summary_label = QLabel("")
-        self._summary_label.setStyleSheet(f"color: {theme.NEON_PINK}; font-family: Consolas; font-size: 12pt; font-weight: bold;")
+        self._summary_label.setStyleSheet(
+            f"color: {theme.NEON_PINK}; font-family: Consolas; font-size: 12pt; font-weight: bold;"
+        )
         layout.addWidget(self._summary_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["檔案", "修改日期 / 操作"])
         self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -244,7 +180,6 @@ class DupePage(QWidget):
         splitter.addWidget(self._preview_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-
         layout.addWidget(splitter, 1)
 
         bottom = QFrame()
@@ -263,7 +198,6 @@ class DupePage(QWidget):
         self._delete_checked_btn.clicked.connect(self._delete_checked)
         bottom_layout.addWidget(self._delete_checked_btn)
         layout.addWidget(bottom)
-
         return page
 
     def _build_preview_panel(self) -> QWidget:
@@ -282,7 +216,55 @@ class DupePage(QWidget):
         layout.addStretch(1)
         return panel
 
-    def _on_scan_finished(self, groups: list[list[str]]) -> None:
+    # ----------------------------------------------------------------- SCAN
+    def _start_scan(self) -> None:
+        folders = self._folder_picker.selected_folders()
+        targets = folders if folders else self._drive_chips.checked_keys()
+        if not targets:
+            return
+        keys = self._type_chips.checked_keys()
+        mode = keys[0] if keys else "image"
+        _label, threshold, min_match_len = STRICTNESS_OPTIONS[self._strict_combo.currentIndex()]
+
+        self._phase_label.setText("正在計算指紋…")
+        self._progress_bar.set_indeterminate(True)
+        self._phase_path_label.setText("")
+        self._stack.setCurrentWidget(self._scanning_page)
+
+        self._thread = QThread(self)
+        self._worker = SimilarityWorker(targets, mode, threshold, min_match_len)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._on_scan_finished)
+        self._thread.start()
+
+    def _cancel_scan(self) -> None:
+        if self._worker:
+            self._worker.cancel()
+
+    def _on_progress(self, phase: int, done: int, total: int, path: str) -> None:
+        metrics = QFontMetrics(self._phase_path_label.font())
+        self._phase_path_label.setText(metrics.elidedText(path, Qt.TextElideMode.ElideMiddle, PATH_ELIDE_WIDTH))
+        if phase == 1:
+            self._phase_label.setText(f"第 1/2 階段:計算指紋(已處理 {done} 個)")
+            self._progress_bar.set_indeterminate(True)
+        else:
+            self._phase_label.setText(f"第 2/2 階段:相似比對({done}/{total})")
+            if total:
+                self._progress_bar.set_indeterminate(False)
+                self._progress_bar.setValue(min(int(done / total * 100), 100))
+            else:
+                self._progress_bar.set_indeterminate(True)
+
+    def _on_error(self, message: str) -> None:
+        QMessageBox.warning(self, "相似偵測無法執行", message)
+
+    def _on_scan_finished(self, groups: list) -> None:
         cancelled = bool(self._worker and self._worker.cancelled)
         self._thread = None
         self._worker = None
@@ -291,9 +273,10 @@ class DupePage(QWidget):
             return
 
         self._groups = []
-        for group_paths in groups:
+        self._group_segments = []
+        for group in groups:
             entries = []
-            for path in group_paths:
+            for path in group["paths"]:
                 try:
                     st = os.stat(path)
                 except OSError:
@@ -301,6 +284,7 @@ class DupePage(QWidget):
                 entries.append({"path": path, "size": st.st_size, "mtime": st.st_mtime})
             if len(entries) >= 2:
                 self._groups.append(entries)
+                self._group_segments.append(group.get("segments", []))
 
         self._populate_tree()
         self._stack.setCurrentWidget(self._results_page)
@@ -309,18 +293,13 @@ class DupePage(QWidget):
         self._tree.itemChanged.disconnect(self._on_item_changed)
         self._tree.clear()
 
-        total_freed = 0
-        for group in self._groups:
-            size = group[0]["size"]
+        for group, segments in zip(self._groups, self._group_segments):
             n = len(group)
-            freed = (n - 1) * size
-            total_freed += freed
-            top = QTreeWidgetItem([f"{n} 個相同檔案 × 每個 {format_size(size)},可省 {format_size(freed)}", ""])
+            largest = max(e["size"] for e in group)
+            top = QTreeWidgetItem([f"{n} 個相似檔案(最大 {format_size(largest)})", ""])
             top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             self._tree.addTopLevelItem(top)
 
-            # 「保留最舊/最新」放在群組本身這一列(column 1),不要當成獨立浮動列,
-            # 這樣操作對象一看就懂是這個群組,不會誤以為是某個檔案列的東西。
             keep_row = QWidget()
             keep_layout = QHBoxLayout(keep_row)
             keep_layout.setContentsMargins(2, 0, 2, 0)
@@ -336,29 +315,41 @@ class DupePage(QWidget):
             keep_layout.addWidget(newest_btn)
             self._tree.setItemWidget(top, 1, keep_row)
 
-            names = [os.path.basename(e["path"]) for e in group]
-            copy_style = [analysis.is_copy_style_name(n) for n in names]
-            auto_check = any(copy_style) and not all(copy_style)
-
-            for entry, is_copy in zip(group, copy_style):
+            for entry in group:
                 child = QTreeWidgetItem([display_path(entry["path"]), analysis.format_relative_time(entry["mtime"])])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Checked if (auto_check and is_copy) else Qt.CheckState.Unchecked)
+                child.setCheckState(0, Qt.CheckState.Unchecked)
                 child.setData(0, Qt.ItemDataRole.UserRole, entry)
                 top.addChild(child)
 
+            # 影片:把相似片段區間掛成不可勾選的說明列
+            for seg in segments:
+                info = QTreeWidgetItem([f"↳ {seg}", ""])
+                info.setFlags(info.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                info.setForeground(0, self._dim_brush())
+                top.addChild(info)
+
             top.setExpanded(True)
 
-        self._summary_label.setText(f"共 {len(self._groups)} 組重複,合計可釋放 {format_size(total_freed)}")
+        self._summary_label.setText(f"共 {len(self._groups)} 組相似檔案")
         self._tree.itemChanged.connect(self._on_item_changed)
         self._check_guard()
 
+    def _dim_brush(self):
+        from PyQt6.QtGui import QColor
+
+        return QColor(theme.TEXT_DIM)
+
     def _keep_extreme(self, group_item: QTreeWidgetItem, keep_oldest: bool) -> None:
-        children = [group_item.child(i) for i in range(group_item.childCount()) if group_item.child(i).data(0, Qt.ItemDataRole.UserRole)]
+        children = [
+            group_item.child(i)
+            for i in range(group_item.childCount())
+            if group_item.child(i).data(0, Qt.ItemDataRole.UserRole)
+        ]
         if not children:
             return
-        target = min(children, key=lambda c: c.data(0, Qt.ItemDataRole.UserRole)["mtime"]) if keep_oldest else \
-            max(children, key=lambda c: c.data(0, Qt.ItemDataRole.UserRole)["mtime"])
+        key = lambda c: c.data(0, Qt.ItemDataRole.UserRole)["mtime"]
+        target = min(children, key=key) if keep_oldest else max(children, key=key)
         for c in children:
             c.setCheckState(0, Qt.CheckState.Unchecked if c is target else Qt.CheckState.Checked)
 
@@ -370,11 +361,12 @@ class DupePage(QWidget):
         any_full_group = False
         for i in range(self._tree.topLevelItemCount()):
             top = self._tree.topLevelItem(i)
-            children = [top.child(j) for j in range(top.childCount()) if top.child(j).data(0, Qt.ItemDataRole.UserRole)]
+            children = [
+                top.child(j) for j in range(top.childCount()) if top.child(j).data(0, Qt.ItemDataRole.UserRole)
+            ]
             if children and all(c.checkState(0) == Qt.CheckState.Checked for c in children):
                 any_full_group = True
                 break
-
         if any_full_group:
             self._guard_label.setText("每組至少保留一個")
             self._delete_checked_btn.setEnabled(False)
@@ -386,10 +378,10 @@ class DupePage(QWidget):
         items = self._tree.selectedItems()
         if not items:
             return
-        item = items[0]
-        data = item.data(0, Qt.ItemDataRole.UserRole)
+        data = items[0].data(0, Qt.ItemDataRole.UserRole)
         if not data:
             self._preview_image.setText("")
+            self._preview_image.setPixmap(QPixmap())
             self._preview_meta.setText("")
             return
 
@@ -398,18 +390,21 @@ class DupePage(QWidget):
         if ext in analysis.IMAGE_EXTS:
             pix = QPixmap(path)
             if pix.isNull():
-                self._preview_image.setText("無法預覽")
                 self._preview_image.setPixmap(QPixmap())
+                self._preview_image.setText("無法預覽")
             else:
-                scaled = pix.scaled(320, 320, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                scaled = pix.scaled(
+                    320, 320, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                )
                 self._preview_image.setPixmap(scaled)
                 self._preview_image.setText("")
         else:
             self._preview_image.setPixmap(QPixmap())
-            self._preview_image.setText("(不支援預覽)" if ext in analysis.VIDEO_EXTS else "無法預覽")
+            self._preview_image.setText("(影片不支援預覽)")
 
         self._preview_meta.setText(
-            f"{os.path.basename(path)}\n大小:{format_size(data['size'])}\n修改日期:{analysis.format_relative_time(data['mtime'])}\n{path}"
+            f"{os.path.basename(path)}\n大小:{format_size(data['size'])}\n"
+            f"修改日期:{analysis.format_relative_time(data['mtime'])}\n{path}"
         )
 
     def _iter_checked_entries(self):
@@ -428,22 +423,22 @@ class DupePage(QWidget):
         total_size = sum(d["size"] for _c, d in entries)
         huge = any(d["size"] > HUGE_FILE_THRESHOLD for _c, d in entries)
         msg = f"確定要刪除勾選的 {len(entries)} 個檔案嗎?\n總計 {format_size(total_size)}"
-        if not confirm_delete(self, "刪除重複檔案", msg, huge_file=huge):
+        if not confirm_delete(self, "刪除相似檔案", msg, huge_file=huge):
             return
 
         failures = []
         for child, data in entries:
             ok, message = safe_trash_delete(data["path"], data["size"])
             if ok:
-                parent = child.parent()
-                parent.removeChild(child)
+                child.parent().removeChild(child)
             else:
                 failures.append(f"{data['path']}: {message}")
 
-        # 清掉不再有重複的組(剩不到 2 個檔案的組已無意義)
         for i in reversed(range(self._tree.topLevelItemCount())):
             top = self._tree.topLevelItem(i)
-            remaining = [top.child(j) for j in range(top.childCount()) if top.child(j).data(0, Qt.ItemDataRole.UserRole)]
+            remaining = [
+                top.child(j) for j in range(top.childCount()) if top.child(j).data(0, Qt.ItemDataRole.UserRole)
+            ]
             if len(remaining) < 2:
                 self._tree.takeTopLevelItem(i)
 
@@ -466,6 +461,11 @@ class DupePage(QWidget):
             from PyQt6.QtWidgets import QApplication
 
             QApplication.clipboard().setText(data["path"])
-        elif action == open_action:
-            if os.path.exists(data["path"]):
-                subprocess.Popen(["explorer", "/select,", data["path"]])
+        elif action == open_action and os.path.exists(data["path"]):
+            subprocess.Popen(["explorer", "/select,", data["path"]])
+
+    def shutdown(self) -> None:
+        if self._worker:
+            self._worker.cancel()
+        if self._thread:
+            self._thread.wait(2000)

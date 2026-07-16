@@ -1,2 +1,5 @@
 PyQt6>=6.5.0
 send2trash>=1.8.2
+# 相似圖片/影片偵測(相似檔案頁面)用:影片解碼取樣 + 感知雜湊。numpy 為其相依,會一併安裝。
+# 注意:打包時 NeonSweep.spec 的 excludes 需移除 numpy,否則相似偵測在 frozen exe 內會壞掉。
+opencv-python>=4.8
