@@ -224,7 +224,7 @@ class SimilarityPage(QWidget):
             return
         keys = self._type_chips.checked_keys()
         mode = keys[0] if keys else "image"
-        _label, threshold, min_match_len = STRICTNESS_OPTIONS[self._strict_combo.currentIndex()]
+        _label, threshold, min_match_seconds = STRICTNESS_OPTIONS[self._strict_combo.currentIndex()]
 
         self._phase_label.setText("正在計算指紋…")
         self._progress_bar.set_indeterminate(True)
@@ -232,7 +232,7 @@ class SimilarityPage(QWidget):
         self._stack.setCurrentWidget(self._scanning_page)
 
         self._thread = QThread(self)
-        self._worker = SimilarityWorker(targets, mode, threshold, min_match_len)
+        self._worker = SimilarityWorker(targets, mode, threshold, min_match_seconds)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._thread.quit)

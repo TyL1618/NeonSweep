@@ -580,8 +580,13 @@ def atime_reliable(drive_root: str) -> bool:
 **指紋:dHash。** 灰階 → resize 9×8 → 相鄰像素亮度差 → 64-bit。圖片走 `cv2.imdecode(np.fromfile(path))` 而非 `cv2.imread`(後者對 Windows 非 ASCII 路徑會失敗)。
 
 - **圖片** `find_similar_images`:`safe_walk` 收 `IMAGE_EXTS` → 算 dHash → 兩兩 Hamming 距離 ≤ 門檻用 Union-Find 遞移合併成群。pairwise 是 O(n²),但用 numpy 向量化 popcount(`np.unpackbits`)加速。**抓得到**縮放/轉檔/重壓縮/亮度微調;**抓不到**裁切/局部塗改/浮水印遮蓋(那要 ORB/SIFT 局部特徵匹配,明確不在範圍)。
-- **影片** `find_similar_videos`:`cv2.VideoCapture` 按**時間點**(`CAP_PROP_POS_MSEC`,每 `VIDEO_INTERVAL_SEC` 秒,上限 `VIDEO_MAX_SAMPLES` 幀)取樣算 dHash → 指紋序列(故不受 FPS 差異影響)。非 ASCII 路徑後援:`GetShortPathNameW` 取 8.3 短路徑重試。兩片指紋序列用 **Smith-Waterman 區域比對**(`_local_align`)找最相似的連續片段,允許 gap → 同時處理掐頭去尾與抽掉中段的剪輯。`min_match_len`(最短連續相似取樣點)過濾黑畫面/共用片頭的巧合匹配。效能:先用向量化 match 矩陣做便宜初篩(共享畫面數不足就跳過昂貴的 Python DP),只有可能重疊的配對才跑 Smith-Waterman。
-- 設定列:類型 chips(圖片/影片,**單選**)+ 相似程度下拉(寬鬆/標準/嚴格,對映圖片 Hamming 門檻與影片 `min_match_len`)+ 磁碟/資料夾範圍(見 §8.7 註)。
+- **影片** `find_similar_videos`(**兩階段:粗篩→精修**):
+  1. **粗篩指紋** `build_video_print`:每部影片各自按時間點(`CAP_PROP_POS_MSEC`)取樣算 dHash,間隔 = `max(base_interval, duration/max_samples)`——**時長 <= base_interval×max_samples(預設 300 秒)的短片,間隔維持 base_interval(1 秒)不受影響;只有長片才自動放寬間隔**,保證固定的 `max_samples`(預設 300)個樣本點就能涵蓋全片。這是修過的設計:早期版本用固定 1 秒間隔 + 樣本數上限,長片(例如 60 分鐘)只會取樣到前 5 分鐘,中後段剪出來的片段完全偵測不到,已改掉。
+  2. **兩邊都還沒被放寬過(短片對短片)**:兩邊本來就是同一個間隔、相位天生一致(都從 t=0 開始),直接對兩者的粗篩指紋跑 **Smith-Waterman 區域比對**(`_local_align`,允許 gap → 處理掐頭去尾/抽掉中段的剪輯)即可,不必再解一次影片。
+  3. **任一邊被放寬過(牽涉到長片)**:改用 **位移投票**(`_estimate_offset`):不要求兩邊取樣點對齊到同一個網格相位(兩邊各自從 t=0 取樣,真正的重疊位移是未知數、不會剛好是取樣間隔的整數倍,硬要對齊網格反而讓兩邊取樣點集合幾乎不重疊而找不到匹配——這是實作時踩到的一個坑,類比 Shazam 音訊指紋的做法改成位移投票才修好);粗篩比對抓出「哪些樣本對內容相近」,每一對估出一個位移量,投票選出票數最高的候選,再把短的那部投影到長的那部時間軸上,得到候選重疊窗。
+  4. **精修** `_refine_match`:只在候選窗附近(留 margin)重新用 `base_interval` 密集取樣兩段短內容、重新跑一次(範圍小、成本低的)Smith-Waterman,拿到精確到秒的邊界,同時二次驗證排除粗篩階段的巧合匹配。`min_match_seconds`(最短連續相似秒數)在這裡把關,過濾黑畫面/共用片頭之類的巧合。
+  - 非 ASCII 路徑後援:`GetShortPathNameW` 取 8.3 短路徑重試。效能:粗篩樣本數固定(≤ max_samples),DP 成本不隨影片長度增長;精修只在候選窗這種小範圍內重新解碼,不必為了長片全片精細比對而讓運算量爆炸。
+- 設定列:類型 chips(圖片/影片,**單選**)+ 相似程度下拉(寬鬆/標準/嚴格,對映圖片 Hamming 門檻與影片 `min_match_seconds`)+ 磁碟/資料夾範圍(見 §8.7 註)。
 - 結果 UI 沿用 §8.3 骨架:QTreeWidget 分群 + `QPixmap` 縮圖預覽(影片只顯示中繼資料)+ checkbox + 「保留最舊/最新」+ 防呆「每組至少保留一個」+ `send2trash` 刪除。影片群另把相似片段區間掛成不可勾選的說明列(`↳ A 00:32–04:18 ≈ B 01:05–04:51`)。
 - **不做指紋快取**(每次掃描重算)——列為後續可加強項。
 
@@ -745,6 +750,7 @@ PyInstaller `--noconsole --onefile`,manifest 維持 asInvoker,附 icon。
 - [ ] 空間圖:掃一個資料夾 → 方塊面積比例正確、點資料夾可下鑽、麵包屑可回上層、hover 顯示路徑
 - [ ] 相似圖片:同一張圖的原圖 + 縮放版 + 重壓縮版被歸為同一群;不相干圖片不誤入
 - [ ] 相似影片:同一部影片不同解析度/FPS + 剪掉頭尾的版本被歸為同一群,並顯示相似片段區間
+- [ ] 相似影片:長片(超過 base_interval×max_samples,預設 300 秒)剪出中後段的短片,仍能被偵測到(驗證粗篩+位移投票有涵蓋全片,不是只有前 5 分鐘)
 - [ ] 相似檔案頁:每組全勾時刪除鈕 disabled(沿用重複檔案頁防呆)
 - [ ] 打包後 exe:相似偵測頁能實際讀圖/解影片(確認 cv2 有打包進 onefile)
 

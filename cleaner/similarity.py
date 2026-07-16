@@ -4,8 +4,10 @@
 
 - 圖片:dHash(相鄰像素亮度差)→ Hamming 距離分群。抓得到縮放/轉檔/重壓縮/亮度微調;
   抓不到裁切/局部塗改(那要 ORB/SIFT 特徵匹配,不在本模組範圍)。
-- 影片:按「時間點」每 interval 秒取樣一幀算 dHash → 指紋序列;兩序列用 Smith-Waterman
-  區域比對找最相似的連續片段,允許 gap 以處理掐頭去尾 / 抽掉中段的剪輯。
+- 影片:兩階段「粗篩 → 精修」。每部影片先用**依全片長度自動放寬的間隔**取樣(保證固定
+  樣本數就能涵蓋全片,不會漏掉任何一段——短片仍維持 1 秒精細度不受影響),粗篩找出候選
+  重疊區間後,只針對那個小範圍時間窗重新用 1 秒間隔取樣、重新比對,拿到精確到秒的邊界。
+  兩階段都用 Smith-Waterman 區域比對,允許 gap 以處理掐頭去尾 / 抽掉中段的剪輯。
 """
 
 import ctypes
@@ -87,22 +89,17 @@ def _open_capture(path: str):
     return None
 
 
-def video_fingerprint(path: str, interval_sec: float = VIDEO_INTERVAL_SEC, max_samples: int = VIDEO_MAX_SAMPLES):
-    """回傳 (指紋序列 list[int], 時長秒數)。讀不到回傳 (None, 0.0)。
-    按時間點(CAP_PROP_POS_MSEC)取樣,故不受 FPS 差異影響。
+def _sample_window(path: str, start_sec: float, end_sec: float, interval_sec: float, max_samples: int | None = None):
+    """對 [start_sec, end_sec) 這段時間窗,按 interval_sec 取樣算 dHash,回傳 list[int]。
+    供粗篩(全片,start=0/end=duration)與精修(候選片段附近的小窗)共用。
     """
     cap = _open_capture(path)
     if cap is None:
-        return None, 0.0
+        return []
     try:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
-        duration = (frame_count / fps) if fps > 0 else 0.0
-        if duration <= 0:
-            return None, 0.0
         hashes = []
-        t = 0.0
-        while t < duration and len(hashes) < max_samples:
+        t = max(0.0, start_sec)
+        while t < end_sec and (max_samples is None or len(hashes) < max_samples):
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
             ok, frame = cap.read()
             if not ok:
@@ -110,11 +107,70 @@ def video_fingerprint(path: str, interval_sec: float = VIDEO_INTERVAL_SEC, max_s
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             hashes.append(_dhash_from_gray(gray))
             t += interval_sec
-        return (hashes or None), duration
+        return hashes
     except Exception:
-        return None, 0.0
+        return []
     finally:
         cap.release()
+
+
+def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_samples: int = VIDEO_MAX_SAMPLES):
+    """單一影片的「原生」粗篩指紋。間隔依全片長度自動放寬(`max(base_interval, duration/max_samples)`),
+    保證固定的 max_samples 個樣本點就能涵蓋全片——不會像固定間隔那樣,長片只取樣得到前面一小段
+    (例如 60 分鐘的影片若固定每秒取樣、上限 300 個樣本,只能涵蓋前 5 分鐘,中後段被剪出來的
+    片段會完全偵測不到)。**時長 <= base_interval × max_samples 的短片,間隔仍是 base_interval,
+    精細度完全不受影響**——放寬只發生在真正需要的長片上。
+
+    回傳 dict {"path","duration","interval","hashes"(np.uint64 array)},讀不到回傳 None。
+    """
+    cap = _open_capture(path)
+    if cap is None:
+        return None
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+        duration = (frame_count / fps) if fps > 0 else 0.0
+        if duration <= 0:
+            return None
+        interval = max(base_interval, duration / max_samples)
+        hashes = []
+        t = 0.0
+        while t < duration and len(hashes) < max_samples:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+            ok, frame = cap.read()
+            if not ok:
+                break
+            hashes.append(_dhash_from_gray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+            t += interval
+        if not hashes:
+            return None
+        return {"path": path, "duration": duration, "interval": interval, "hashes": np.array(hashes, dtype=np.uint64)}
+    except Exception:
+        return None
+    finally:
+        cap.release()
+
+
+def _estimate_offset(va: dict, vb: dict, frame_threshold: int):
+    """兩部影片的粗篩指紋(間隔、相位都可能不同,不要求對齊)兩兩比對,每一對匹配的樣本都能
+    估出一個「B 在 A 時間軸上的起點位移」;把這些位移粗略分桶投票,回傳票數最多的位移候選。
+
+    這裡刻意不用「把兩邊指紋硬併到同一個間隔/相位再跑 Smith-Waterman」的做法——短片自己的
+    取樣起點跟長片的粗篩取樣起點通常對不上相位(兩者都是各自從 t=0 開始,而真正重疊的位移
+    量是未知數,不會剛好是間隔的整數倍),硬併只會讓兩邊的取樣點集合幾乎不重疊、比對失敗。
+    改成不管相位、直接抓「哪一對樣本內容相近」,再用位移投票找出最可能的重疊位置,不受兩邊
+    間隔/相位不同影響。回傳 (offset_seconds, votes) 或 (None, 0)。
+    """
+    match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold)
+    if not match.any():
+        return None, 0
+    ia, ib = np.nonzero(match)
+    offsets = ia.astype(np.float64) * va["interval"] - ib.astype(np.float64) * vb["interval"]
+    bucket = max(va["interval"], vb["interval"])
+    buckets = np.round(offsets / bucket).astype(np.int64)
+    values, counts = np.unique(buckets, return_counts=True)
+    best_idx = int(np.argmax(counts))
+    return float(values[best_idx]) * bucket, int(counts[best_idx])
 
 
 # ----------------------------------------------------------------------
@@ -279,23 +335,74 @@ def _fmt_ts(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def _refine_match(
+    path_a: str,
+    path_b: str,
+    ta0: float,
+    ta1: float,
+    tb0: float,
+    tb1: float,
+    frame_threshold: int,
+    base_interval: float = VIDEO_INTERVAL_SEC,
+):
+    """精修階段:粗篩只給了「大概哪一段對得上」的候選時間窗(可能因為粗篩間隔較粗而不準)。
+    這裡只針對候選窗附近(留一點 margin 免得邊界剛好切到)重新用 base_interval 密集取樣,
+    重新跑一次(範圍很小、成本低的)Smith-Waterman,拿到精確到秒的邊界,同時二次驗證排除
+    粗篩階段的巧合匹配。回傳 (a_start,a_end,b_start,b_end,matched_seconds) 或 None(驗證失敗)。
+    """
+    margin = base_interval * 4
+    a_start, a_end = max(0.0, ta0 - margin), ta1 + margin
+    b_start, b_end = max(0.0, tb0 - margin), tb1 + margin
+
+    hash_a = _sample_window(path_a, a_start, a_end, base_interval)
+    hash_b = _sample_window(path_b, b_start, b_end, base_interval)
+    if len(hash_a) < 2 or len(hash_b) < 2:
+        return None
+
+    match = _match_matrix(np.array(hash_a, dtype=np.uint64), np.array(hash_b, dtype=np.uint64), frame_threshold)
+    best, a0, a1, b0, b1 = _local_align(match.tolist(), len(hash_a), len(hash_b))
+    if best <= 0:
+        return None
+    matched_sec = min(a1 - a0 + 1, b1 - b0 + 1) * base_interval
+    return (
+        a_start + a0 * base_interval,
+        a_start + (a1 + 1) * base_interval,
+        b_start + b0 * base_interval,
+        b_start + (b1 + 1) * base_interval,
+        matched_sec,
+    )
+
+
 def find_similar_videos(
     targets,
-    min_match_len=20,
+    min_match_seconds=20,
     frame_threshold=VIDEO_FRAME_THRESHOLD,
-    interval_sec=VIDEO_INTERVAL_SEC,
+    base_interval=VIDEO_INTERVAL_SEC,
+    max_samples=VIDEO_MAX_SAMPLES,
     progress_cb=None,
     cancel_check=None,
 ):
     """回傳 list[dict],每組:{"paths": [...], "segments": [人類可讀的相似片段字串, ...]}。
-    min_match_len:最短連續相似片段(取樣點數),過濾黑畫面/共用片頭之類的巧合匹配。
+    min_match_seconds:最短連續相似片段(秒),過濾黑畫面/共用片頭之類的巧合匹配。
+
+    兩階段「粗篩→精修」(見模組開頭說明):
+    - 粗篩:每部影片各自用 build_video_print 算出「涵蓋全片」的原生指紋(短片維持
+      base_interval 精細度,長片自動放寬間隔)。**兩邊都還沒被放寬過**(短片對短片)時,兩者
+      本來就是同一個間隔,直接用 Smith-Waterman 對齊即可。只要**任一邊被放寬過**(牽涉到長
+      片),就改用 `_estimate_offset` 的位移投票:不要求兩邊取樣點對齊到同一個網格相位
+      (兩邊各自從 t=0 開始取樣,真正的重疊位移是未知數,不會剛好是取樣間隔的整數倍,若硬
+      要對齊網格反而會讓兩邊的取樣點集合幾乎不重疊、比對失敗),而是直接找出「哪些樣本對內容
+      相近」,再用這些配對估出的位移做投票,取票數最高的位移當候選重疊窗。
+    - 精修:候選窗只是「大概哪一段」,接下來只針對那個小時間窗附近(含 margin)重新用
+      base_interval 密集取樣、重新比對,拿到精確到秒的邊界並二次驗證排除巧合,真正的
+      min_match_seconds 門檻在這裡把關。
     """
 
     def cancelled():
         return bool(cancel_check and cancel_check())
 
-    # 階段 1:蒐集 + 算指紋序列
-    videos = []  # (path, np.uint64 array, duration)
+    # 階段 1:蒐集 + 算每部影片的粗篩指紋
+    videos = []  # list[dict]:build_video_print 的回傳
     scanned = 0
     last_emit = 0.0
     for root in targets:
@@ -310,16 +417,15 @@ def find_similar_videos(
                 if now - last_emit >= PROGRESS_TIME_INTERVAL:
                     last_emit = now
                     progress_cb(1, scanned, 0, entry.path)
-            seq, duration = video_fingerprint(entry.path, interval_sec=interval_sec)
-            if seq and len(seq) >= min_match_len:
-                videos.append((entry.path, np.array(seq, dtype=np.uint64), duration))
+            vp = build_video_print(entry.path, base_interval=base_interval, max_samples=max_samples)
+            if vp is not None and vp["duration"] >= min_match_seconds:
+                videos.append(vp)
 
     n = len(videos)
     if n < 2:
         return []
 
-    # 階段 2:兩兩比對。先用向量化 match 矩陣做便宜的初篩(共享畫面數不足就跳過昂貴的 DP),
-    # 只有可能重疊的配對才跑 Smith-Waterman。
+    # 階段 2:兩兩粗篩比對,通過的配對才跑精修。
     uf = _UnionFind(n)
     pair_detail: dict[tuple[int, int], str] = {}
     total_pairs = n * (n - 1) // 2
@@ -328,26 +434,53 @@ def find_similar_videos(
     for i in range(n):
         if cancelled():
             return []
-        pa, a, _da = videos[i]
+        va = videos[i]
         for j in range(i + 1, n):
             done_pairs += 1
             if progress_cb:
                 now = time.monotonic()
                 if now - last_emit >= PROGRESS_TIME_INTERVAL:
                     last_emit = now
-                    progress_cb(2, done_pairs, total_pairs, pa)
-            pb, b, _db = videos[j]
-            match = _match_matrix(a, b, frame_threshold)
-            # 初篩:a 有多少幀在 b 找得到近似畫面
-            if int(match.any(axis=1).sum()) < min_match_len:
-                continue
-            best, a0, a1, b0, b1 = _local_align(match.tolist(), len(a), len(b))
-            if best <= 0 or (a1 - a0 + 1) < min_match_len:
-                continue
+                    progress_cb(2, done_pairs, total_pairs, va["path"])
+            vb = videos[j]
+            both_fine = va["interval"] <= base_interval * 1.0001 and vb["interval"] <= base_interval * 1.0001
+
+            if both_fine:
+                # 兩邊都還沒被放寬(短片對短片),原生指紋本來就是同一個間隔,兩邊取樣起點都是
+                # 各自的 t=0、相位天生一致,直接對齊即可,不必再解一次影片。
+                match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold)
+                if not match.any():
+                    continue
+                best, a0, a1, b0, b1 = _local_align(match.tolist(), len(va["hashes"]), len(vb["hashes"]))
+                if best <= 0:
+                    continue
+                matched_sec = min(a1 - a0 + 1, b1 - b0 + 1) * base_interval
+                if matched_sec < min_match_seconds:
+                    continue
+                fa0, fa1 = a0 * base_interval, (a1 + 1) * base_interval
+                fb0, fb1 = b0 * base_interval, (b1 + 1) * base_interval
+            else:
+                # 至少一邊牽涉到長片(間隔被放寬過):兩邊取樣的相位不保證對齊,改用位移投票
+                # 找出候選重疊窗,再把 B 的全長投影到 A 的時間軸上,只在那個窗附近精修。
+                offset, votes = _estimate_offset(va, vb, frame_threshold)
+                if offset is None or votes < 2:
+                    continue
+                ta0 = max(0.0, offset)
+                ta1 = min(va["duration"], offset + vb["duration"])
+                if ta1 - ta0 < min_match_seconds:
+                    continue
+                tb0, tb1 = ta0 - offset, ta1 - offset
+                refined = _refine_match(va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval)
+                if refined is None:
+                    continue
+                fa0, fa1, fb0, fb1, matched_sec = refined
+                if matched_sec < min_match_seconds:
+                    continue
+
             uf.union(i, j)
             seg = (
-                f"{os.path.basename(pa)} {_fmt_ts(a0 * interval_sec)}–{_fmt_ts(a1 * interval_sec)}"
-                f"  ≈  {os.path.basename(pb)} {_fmt_ts(b0 * interval_sec)}–{_fmt_ts(b1 * interval_sec)}"
+                f"{os.path.basename(va['path'])} {_fmt_ts(fa0)}–{_fmt_ts(fa1)}"
+                f"  ≈  {os.path.basename(vb['path'])} {_fmt_ts(fb0)}–{_fmt_ts(fb1)}"
             )
             pair_detail[(i, j)] = seg
 
@@ -361,5 +494,5 @@ def find_similar_videos(
             continue
         member_set = set(members)
         segments = [seg for (i, j), seg in pair_detail.items() if i in member_set and j in member_set]
-        result.append({"paths": [videos[i][0] for i in members], "segments": segments})
+        result.append({"paths": [videos[i]["path"] for i in members], "segments": segments})
     return result
