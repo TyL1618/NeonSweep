@@ -579,7 +579,8 @@ def atime_reliable(drive_root: str) -> bool:
 
 **指紋:dHash。** 灰階 → resize 9×8 → 相鄰像素亮度差 → 64-bit。圖片走 `cv2.imdecode(np.fromfile(path))` 而非 `cv2.imread`(後者對 Windows 非 ASCII 路徑會失敗)。
 
-- **圖片** `find_similar_images`:`safe_walk` 收 `IMAGE_EXTS` → 算 dHash → 兩兩 Hamming 距離 ≤ 門檻用 Union-Find 遞移合併成群。pairwise 是 O(n²),但用 numpy 向量化 popcount(`np.unpackbits`)加速。**抓得到**縮放/轉檔/重壓縮/亮度微調;**抓不到**裁切/局部塗改/浮水印遮蓋(那要 ORB/SIFT 局部特徵匹配,明確不在範圍)。
+- **圖片** `find_similar_images`:`safe_walk` 收 `IMAGE_EXTS` → 算 dHash → **錨點分群**(不是 Union-Find)。pairwise 是 O(n²),用 numpy 向量化 popcount 加速。**抓得到**縮放/轉檔/重壓縮/亮度微調;**抓不到**裁切/局部塗改/浮水印遮蓋(那要 ORB/SIFT 局部特徵匹配,明確不在範圍)。
+  - **分群演算法(重要,不要改回 Union-Find)**:最早用 Union-Find 遞移合併(A~B、B~C 在門檻內就焊進同一組),使用者實測掃 `C:\Windows\Web` 這種平滑漸層佈景桌布時,炸出一組 27,787 個成員、組內任兩張圖可能完全不像的長鏈——dHash 對平滑漸層圖案的鑑別力本來就弱,加上 Union-Find 的遞移合併沒有距離上限,只要有夠多「稍微像一點」的過渡圖當墊腳石就會焊成一條長鏈。改成**錨點分群(star clustering)**:依序把每張還沒分組的圖片當錨點,只收「跟錨點本身距離 ≤ threshold」的圖片進同一組(不是「跟組內任何成員像就收」),已分組的圖片不會再被其他錨點搶走。因為 Hamming 距離滿足三角不等式,**同一組內任兩張圖的距離保證 ≤ threshold×2**——現在的 Union-Find 版本沒有這個保證,這是唯一決定性的差異。運算量仍是 O(n²),不會變慢;取捨是分群結果會跟掃描/走訪順序有點關係(哪張圖先當錨點會影響最終怎麼分組),不是全域最優解,但遠勝過「完全沒有距離上限、看緣分連成長鏈」。
 - **影片** `find_similar_videos`(**兩階段:粗篩→精修**):
   1. **粗篩指紋** `build_video_print`:每部影片各自按時間點(`CAP_PROP_POS_MSEC`)取樣算 dHash,間隔 = `max(base_interval, duration/max_samples)`——**時長 <= base_interval×max_samples(預設 300 秒)的短片,間隔維持 base_interval(1 秒)不受影響;只有長片才自動放寬間隔**,保證固定的 `max_samples`(預設 300)個樣本點就能涵蓋全片。這是修過的設計:早期版本用固定 1 秒間隔 + 樣本數上限,長片(例如 60 分鐘)只會取樣到前 5 分鐘,中後段剪出來的片段完全偵測不到,已改掉。
   2. **兩邊都還沒被放寬過(短片對短片)**:兩邊本來就是同一個間隔、相位天生一致(都從 t=0 開始),直接對兩者的粗篩指紋跑 **Smith-Waterman 區域比對**(`_local_align`,允許 gap → 處理掐頭去尾/抽掉中段的剪輯)即可,不必再解一次影片。
@@ -587,6 +588,11 @@ def atime_reliable(drive_root: str) -> bool:
   4. **精修** `_refine_match`:只在候選窗附近(留 margin)重新用 `base_interval` 密集取樣兩段短內容、重新跑一次(範圍小、成本低的)Smith-Waterman,拿到精確到秒的邊界,同時二次驗證排除粗篩階段的巧合匹配。`min_match_seconds`(最短連續相似秒數)在這裡把關,過濾黑畫面/共用片頭之類的巧合。
   - 非 ASCII 路徑後援:`GetShortPathNameW` 取 8.3 短路徑重試。效能:粗篩樣本數固定(≤ max_samples),DP 成本不隨影片長度增長;精修只在候選窗這種小範圍內重新解碼,不必為了長片全片精細比對而讓運算量爆炸。
   - **`_popcount_u64` 用 `np.bitwise_count`(numpy>=2.0)算,不要改回 `np.unpackbits`**:實測後者慢約 240 倍,兩兩比對是這個模組最熱的路徑,大型影片庫(千部等級)會從小時等級的等待時間變成分鐘等級。numpy<2.0 環境有 unpackbits 版本的後援實作。
+  - **階段 1 平行解碼**:`find_similar_videos` 先用 `safe_walk` 蒐集完所有影片路徑(快、事先知道總數),再用 `ThreadPoolExecutor(max_workers=VIDEO_FINGERPRINT_WORKERS)`(預設 4)平行呼叫 `build_video_print`。實測 cv2 的解碼呼叫確實會釋放 GIL,執行緒能拿到真實加速(不需要換成多程序,省掉 IPC/pickle 的複雜度)。worker 數刻意保守——傳統硬碟上開太多平行 seek 反而會互相拖累,4 是加速與 HDD 友善之間的折衷,沒有做成 UI 可調選項。取消時呼叫 `executor.shutdown(wait=False, cancel_futures=True)` 取消還沒開始跑的工作。副作用:`videos` 清單順序不再等於目錄走訪順序(誰先解完誰先進清單),不影響階段 2 分群正確性,只是同一組裡「哪個檔案是錨點/顯示在前面」不再固定。
+  - **階段 2 分群演算法**:跟圖片那邊同一個理由,一樣改用**錨點分群**(不是 Union-Find):依序把還沒分組的影片當錨點,只跟它比對,已分組的影片直接跳過(不會再被拿去測試),省下不少昂貴的位移投票/精修運算。影片理論上一樣有 Union-Find 遞移合併的長鏈風險(雖然因為要求真的有時間軸對齊,實務上機率比圖片低很多),為了一致性與正確性保證一併修掉。
+  - **浮水印寬容度**:算指紋前(僅限影片路徑:`_sample_window`、`build_video_print`)先把畫面四邊各裁掉 `WATERMARK_CROP_MARGIN`(預設 0.10,即留中間 80%×80%)才 resize 成 9×8。**刻意不影響 `image_dhash`(圖片路徑)**——`_dhash_from_gray` 的 `crop_margin` 參數預設 0.0,圖片呼叫完全不傳這個參數,維持原行為。這只能緩解「浮水印在角落/邊緣」的常見情況,對滿版/置中的大浮水印沒有幫助,是提高抓到機率而非保證。
+  - **音軌指紋:目前沒有做,而且已知這個 opencv-python 打包版本的音訊 API 不可靠**。`scripts/probe_audio.py`(開發期診斷用,不進打包)可以驗證:實測 `cv2.VideoCapture` 開檔時帶 `CAP_PROP_AUDIO_STREAM` 參數會直接開檔失敗("unsupported parameters"),退回「先正常開檔、再 `.set(CAP_PROP_AUDIO_STREAM, ...)`」也一樣拿不到音訊(`CAP_PROP_AUDIO_TOTAL_STREAMS` 回傳 `-1`,代表這個屬性根本不支援,不是「這部影片沒音軌」)。也就是說**這條路徑要做音軌指紋,得重新考慮外掛 ffmpeg.exe 或裝 PyAV 這類額外依賴**——不要在沒有先跑過 `probe_audio.py` 確認可行之前,就動手寫音訊取樣/雜湊/比對的正式管線。
+  - **開發環境的終端機雜訊**:掃到解不開的圖片/影片(常見於 `C:\Windows\Web`、`SystemApps` 這類系統資源檔,不嚴格遵守 PNG/GIF 規格)時,OpenCV/libpng 會直接把警告寫到 stderr,不是 Python 例外——`image_dhash`/`build_video_print` 的 try/except 本來就正常跳過這些檔案,不影響掃描結果。`cleaner/similarity.py` 模組載入時呼叫 `cv2.utils.logging.setLogLevel(LOG_LEVEL_SILENT)` 可以壓掉 OpenCV 自己印的 `[ERROR:...]`,但**壓不掉 `libpng warning: ...`**(libpng 是另一個函式庫,沒有開放 API 可以關掉它的警告輸出)。打包後的 exe 是 `console=False`,兩種輸出使用者都看不到,純粹是開發時的雜訊,不代表功能有問題。
 - 設定列:類型 chips(圖片/影片,**單選**)+ **依類型分開的相似程度下拉**(`IMAGE_STRICTNESS_OPTIONS` / `VIDEO_STRICTNESS_OPTIONS`,兩個 `QComboBox` 都建好、依目前選的類型互相切換顯示/隱藏,而不是共用一份選項——圖片跟影片的「嚴格」在技術上是不同的兩組數字,分開才不會誤導)+ 磁碟/資料夾範圍(見 §8.7 註)。標籤直接把數字寫進文字裡(例如「標準(64 bit 指紋最多容許 10 bit 不同)」),不要只寫「標準」兩個字讓使用者猜。
   - 圖片三檔(寬鬆/標準/嚴格)只調一個數字:兩張圖 64-bit dHash 的 Hamming 距離門檻(14/10/6)。
   - 影片三檔調**兩個**數字:每幀 Hamming 門檻(14/10/6,決定「這一幀算不算同一畫面」)**與** `min_match_seconds`(12/20/30 秒,決定「連續相似要多久才不算巧合」)——**這兩個以前是分開的,`SimilarityWorker` 一度只把嚴格程度接到 `min_match_seconds`,每幀門檻被寫死在 `VIDEO_FRAME_THRESHOLD=10` 不受 UI 影響,已經修掉**:`SimilarityWorker.__init__` 的 `threshold` 參數現在對圖片模式是傳給 `find_similar_images(threshold=...)`,對影片模式是傳給 `find_similar_videos(frame_threshold=...)`,同一個參數依模式路由到不同語意,不要誤會成兩種模式共用同一組數字的意思。
@@ -756,6 +762,9 @@ PyInstaller `--noconsole --onefile`,manifest 維持 asInvoker,附 icon。
 - [ ] 相似影片:長片(超過 base_interval×max_samples,預設 300 秒)剪出中後段的短片,仍能被偵測到(驗證粗篩+位移投票有涵蓋全片,不是只有前 5 分鐘)
 - [ ] 相似檔案頁:每組全勾時刪除鈕 disabled(沿用重複檔案頁防呆)
 - [ ] 打包後 exe:相似偵測頁能實際讀圖/解影片(確認 cv2 有打包進 onefile)
+- [ ] 相似影片:大量影片時階段 1 進度條有跳真實百分比(不再是跑馬燈),平行解碼沒有讓分群結果錯亂
+- [ ] 相似影片:角落有色塊/小浮水印的畫面,裁邊後 Hamming 距離應該變小(不會變大)
+- [ ] 相似圖片:掃一個有大量平滑漸層桌布(如 `C:\Windows\Web`)的資料夾,不應該再出現單一組吃下上萬張、組內圖片明顯長不一樣的情況
 
 ---
 

@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTreeWidget,
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import analysis, theme
-from ..utils.fs import display_path, format_size, list_drives
+from ..utils.fs import display_path, format_size, list_drives, wrap_path_for_label
 from ..widgets.neon_progress import NeonProgressBar
 from ..workers import SimilarityWorker
 from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, safe_trash_delete
@@ -251,6 +252,9 @@ class SimilarityPage(QWidget):
         self._preview_meta = QLabel("")
         self._preview_meta.setStyleSheet(f"color: {theme.TEXT_DIM}; font-family: Consolas; font-size: 9pt;")
         self._preview_meta.setWordWrap(True)
+        # 檔案路徑沒有空白給 word-wrap 找斷點,不設這個的話整個面板會被撐到跟路徑一樣寬、
+        # 分隔線怎麼拖都縮不小(見 wrap_path_for_label 的說明)。
+        self._preview_meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self._preview_image)
         layout.addWidget(self._preview_meta)
         layout.addStretch(1)
@@ -294,8 +298,14 @@ class SimilarityPage(QWidget):
         metrics = QFontMetrics(self._phase_path_label.font())
         self._phase_path_label.setText(metrics.elidedText(path, Qt.TextElideMode.ElideMiddle, PATH_ELIDE_WIDTH))
         if phase == 1:
-            self._phase_label.setText(f"第 1/2 階段:計算指紋(已處理 {done} 個)")
-            self._progress_bar.set_indeterminate(True)
+            # 影片模式事先知道總數(平行算指紋前已蒐集完路徑),圖片模式邊掃邊算、total 固定是 0。
+            if total:
+                self._phase_label.setText(f"第 1/2 階段:計算指紋({done}/{total})")
+                self._progress_bar.set_indeterminate(False)
+                self._progress_bar.setValue(min(int(done / total * 100), 100))
+            else:
+                self._phase_label.setText(f"第 1/2 階段:計算指紋(已處理 {done} 個)")
+                self._progress_bar.set_indeterminate(True)
         else:
             self._phase_label.setText(f"第 2/2 階段:相似比對({done}/{total})")
             if total:
@@ -447,7 +457,7 @@ class SimilarityPage(QWidget):
 
         self._preview_meta.setText(
             f"{os.path.basename(path)}\n大小:{format_size(data['size'])}\n"
-            f"修改日期:{analysis.format_relative_time(data['mtime'])}\n{path}"
+            f"修改日期:{analysis.format_relative_time(data['mtime'])}\n{wrap_path_for_label(path)}"
         )
 
     def _iter_checked_entries(self):

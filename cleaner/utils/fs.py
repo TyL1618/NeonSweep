@@ -40,6 +40,19 @@ def display_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def wrap_path_for_label(path: str) -> str:
+    """給會換行的多行 QLabel(如預覽面板的中繼資料)顯示路徑用:在每個 "/" 後面插入零寬空白
+    (U+200B),讓 Qt 的自動換行找得到斷點。
+
+    路徑本身沒有空白給 QLabel 的 word-wrap 判斷斷詞,所以整條路徑會被當成一個不可斷的
+    「單字」,連帶把容器撐寬到整條路徑那麼寬、怎麼拖曳分隔線都縮不小(dupe_page/
+    similarity_page 的預覽面板都出現過這個症狀)。零寬空白肉眼看不到、不影響顯示內容,
+    只是給斷行演算法一個可以換行的位置。**只用在顯示文字上**——複製路徑、開啟檔案這類操作
+    一律要用原始未插入零寬空白的路徑字串。
+    """
+    return display_path(path).replace("/", "/​")
+
+
 def format_size(n: int) -> str:
     """以 1024 為底,輸出 B / KB / MB / GB,保留兩位小數。"""
     size = float(n)

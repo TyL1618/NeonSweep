@@ -13,6 +13,7 @@
 import ctypes
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -20,10 +21,21 @@ import numpy as np
 from .analysis import EXCLUDED_DIRS, IMAGE_EXTS, PROGRESS_TIME_INTERVAL, VIDEO_EXTS
 from .utils.fs import safe_walk
 
+# 只壓 OpenCV 自己的 [ERROR:...] log(解不開的圖片/影片本來就會被 image_dhash/build_video_print
+# 的 try/except 正常跳過,不影響掃描結果)。libpng 的 "libpng warning: ..." 是另一個函式庫自己
+# 寫死輸出到 stderr 的行為,這裡管不到、壓不掉。打包後的 exe 是 console=False,兩種輸出使用者
+# 都看不到,這裡只是降低開發時終端機的雜訊。
+cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+
 # 影片取樣參數
 VIDEO_INTERVAL_SEC = 1.0     # 每幾秒取一幀
 VIDEO_MAX_SAMPLES = 300      # 單片最多取樣幀數(上限,避免超長片把 DP 撐爆)
 VIDEO_FRAME_THRESHOLD = 10   # 兩幀 dHash 視為「相同畫面」的 Hamming 上限
+VIDEO_FINGERPRINT_WORKERS = 4  # 平行算指紋的執行緒數,偏保守——傳統硬碟上開太多平行 seek 反而互相拖累
+
+# 浮水印寬容度:算指紋前先裁掉四邊各這個比例,避開角落/邊緣常見的浮水印位置。
+# 只用在「影片」取樣路徑(_sample_window/build_video_print),刻意不動 image_dhash(圖片路徑)。
+WATERMARK_CROP_MARGIN = 0.10
 
 # Smith-Waterman 計分
 _SW_MATCH = 2
@@ -36,8 +48,18 @@ _SW_GAP = -2
 # ----------------------------------------------------------------------
 
 
-def _dhash_from_gray(gray) -> int:
-    """輸入灰階影像,resize 到 9x8,相鄰像素亮度差 → 64-bit 指紋。"""
+def _dhash_from_gray(gray, crop_margin: float = 0.0) -> int:
+    """輸入灰階影像,resize 到 9x8,相鄰像素亮度差 → 64-bit 指紋。
+
+    crop_margin > 0 時,resize 前先把四邊各裁掉這個比例(浮水印寬容度用,見
+    WATERMARK_CROP_MARGIN)。預設 0 完全不裁,行為與改動前一致——只有影片取樣路徑會傳非零值,
+    image_dhash(圖片路徑)不受影響。
+    """
+    if crop_margin > 0:
+        h, w = gray.shape[:2]
+        mx, my = int(w * crop_margin), int(h * crop_margin)
+        if mx > 0 and my > 0 and w - 2 * mx > 0 and h - 2 * my > 0:
+            gray = gray[my : h - my, mx : w - mx]
     small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
     diff = small[:, 1:] > small[:, :-1]          # 8x8 布林
     packed = np.packbits(diff.flatten())          # 8 bytes
@@ -105,7 +127,7 @@ def _sample_window(path: str, start_sec: float, end_sec: float, interval_sec: fl
             if not ok:
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            hashes.append(_dhash_from_gray(gray))
+            hashes.append(_dhash_from_gray(gray, crop_margin=WATERMARK_CROP_MARGIN))
             t += interval_sec
         return hashes
     except Exception:
@@ -140,7 +162,8 @@ def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_
             ok, frame = cap.read()
             if not ok:
                 break
-            hashes.append(_dhash_from_gray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            hashes.append(_dhash_from_gray(gray, crop_margin=WATERMARK_CROP_MARGIN))
             t += interval
         if not hashes:
             return None
@@ -203,35 +226,16 @@ else:
 
 
 # ----------------------------------------------------------------------
-# Union-Find
-# ----------------------------------------------------------------------
-
-
-class _UnionFind:
-    def __init__(self, n: int):
-        self.parent = list(range(n))
-
-    def find(self, x: int) -> int:
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != root:
-            self.parent[x], x = root, self.parent[x]
-        return root
-
-    def union(self, a: int, b: int) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[rb] = ra
-
-
-# ----------------------------------------------------------------------
 # 圖片相似分群
 # ----------------------------------------------------------------------
 
 
 def find_similar_images(targets, threshold=10, progress_cb=None, cancel_check=None):
-    """回傳 list[list[str]],每組 >=2 張 Hamming 距離 <= threshold(遞移合併)的圖片。"""
+    """回傳 list[list[str]],每組內任兩張圖的 Hamming 距離保證 <= threshold*2(見
+    _anchor_clusters:錨點分群,不用 Union-Find 遞移合併,避免「A~B~C,但 A、C 完全不像」
+    的長鏈問題——這在 Windows 佈景主題這類平滑漸層桌布上曾經把上萬張互不相似的圖片
+    焊成一組,已修掉)。
+    """
 
     def cancelled():
         return bool(cancel_check and cancel_check())
@@ -260,9 +264,10 @@ def find_similar_images(targets, threshold=10, progress_cb=None, cancel_check=No
     if n < 2:
         return []
 
-    # 階段 2:兩兩比對(向量化 popcount)→ Union-Find
+    # 階段 2:錨點分群(向量化 popcount)。
     arr = np.array(hashes, dtype=np.uint64)
-    uf = _UnionFind(n)
+    assigned = np.zeros(n, dtype=bool)
+    groups: list[list[int]] = []
     last_emit = 0.0
     for i in range(n):
         if cancelled():
@@ -271,16 +276,23 @@ def find_similar_images(targets, threshold=10, progress_cb=None, cancel_check=No
         if progress_cb and (i % 10 == 0 or (now - last_emit) >= PROGRESS_TIME_INTERVAL):
             last_emit = now
             progress_cb(2, i, n, paths[i])
+        if assigned[i]:
+            continue
+        assigned[i] = True
         if i + 1 >= n:
-            break
-        dists = _popcount_u64(arr[i + 1:] ^ arr[i])
-        for off in np.nonzero(dists <= threshold)[0]:
-            uf.union(i, i + 1 + int(off))
+            continue
+        later_mask = np.zeros(n, dtype=bool)
+        later_mask[i + 1 :] = ~assigned[i + 1 :]
+        later_idx = np.nonzero(later_mask)[0]
+        if later_idx.size == 0:
+            continue
+        dists = _popcount_u64(arr[later_idx] ^ arr[i])
+        matched = later_idx[dists <= threshold]
+        if matched.size:
+            assigned[matched] = True
+            groups.append([i] + matched.tolist())
 
-    groups: dict[int, list[str]] = {}
-    for i in range(n):
-        groups.setdefault(uf.find(i), []).append(paths[i])
-    return [g for g in groups.values() if len(g) >= 2]
+    return [[paths[idx] for idx in g] for g in groups if len(g) >= 2]
 
 
 # ----------------------------------------------------------------------
@@ -393,9 +405,11 @@ def find_similar_videos(
     max_samples=VIDEO_MAX_SAMPLES,
     progress_cb=None,
     cancel_check=None,
+    fingerprint_workers=VIDEO_FINGERPRINT_WORKERS,
 ):
     """回傳 list[dict],每組:{"paths": [...], "segments": [人類可讀的相似片段字串, ...]}。
     min_match_seconds:最短連續相似片段(秒),過濾黑畫面/共用片頭之類的巧合匹配。
+    fingerprint_workers:階段 1 平行算指紋的執行緒數(cv2 解碼會釋放 GIL,執行緒能真的平行跑)。
 
     兩階段「粗篩→精修」(見模組開頭說明):
     - 粗篩:每部影片各自用 build_video_print 算出「涵蓋全片」的原生指紋(短片維持
@@ -413,23 +427,36 @@ def find_similar_videos(
     def cancelled():
         return bool(cancel_check and cancel_check())
 
-    # 階段 1:蒐集 + 算每部影片的粗篩指紋
-    videos = []  # list[dict]:build_video_print 的回傳
-    scanned = 0
-    last_emit = 0.0
+    # 階段 1a:先蒐集所有影片路徑(快,不必平行化),這樣才能事先知道總數給進度條用。
+    paths = []
     for root in targets:
         for entry in safe_walk(root, exclude_dirs=EXCLUDED_DIRS):
             if cancelled():
                 return []
-            if os.path.splitext(entry.path)[1].lower() not in VIDEO_EXTS:
-                continue
+            if os.path.splitext(entry.path)[1].lower() in VIDEO_EXTS:
+                paths.append(entry.path)
+
+    # 階段 1b:平行算每部影片的粗篩指紋(cv2 的解碼呼叫會釋放 GIL,實測確實有平行加速)。
+    # worker 數偏保守——傳統硬碟上開太多平行 seek 反而會互相拖累。
+    videos = []  # list[dict]:build_video_print 的回傳(順序不保證跟 paths 一致,分群不受影響)
+    total = len(paths)
+    scanned = 0
+    last_emit = 0.0
+    with ThreadPoolExecutor(max_workers=fingerprint_workers) as executor:
+        futures = {
+            executor.submit(build_video_print, p, base_interval, max_samples): p for p in paths
+        }
+        for fut in as_completed(futures):
+            if cancelled():
+                executor.shutdown(wait=False, cancel_futures=True)
+                return []
             scanned += 1
             if progress_cb:
                 now = time.monotonic()
                 if now - last_emit >= PROGRESS_TIME_INTERVAL:
                     last_emit = now
-                    progress_cb(1, scanned, 0, entry.path)
-            vp = build_video_print(entry.path, base_interval=base_interval, max_samples=max_samples)
+                    progress_cb(1, scanned, total, futures[fut])
+            vp = fut.result()
             if vp is not None and vp["duration"] >= min_match_seconds:
                 videos.append(vp)
 
@@ -437,23 +464,35 @@ def find_similar_videos(
     if n < 2:
         return []
 
-    # 階段 2:兩兩粗篩比對,通過的配對才跑精修。
-    uf = _UnionFind(n)
-    pair_detail: dict[tuple[int, int], str] = {}
-    total_pairs = n * (n - 1) // 2
+    # 階段 2:錨點分群(不用 Union-Find)。每部影片只跟「錨點」比對,匹配上就收進錨點的組、
+    # 標記為已分組,之後不會再被其他錨點搶走、也不會再去測試別人。這避免了 Union-Find 遞移
+    # 合併的長鏈問題(A 跟 B 像、B 跟 C 像,但 A、C 完全不像,三個卻被焊進同一組)——圖片那邊
+    # 已經證實過會發生(見 find_similar_images 開頭說明),影片理論上一樣有風險,一併修掉。
+    # 附帶好處:已分組的影片會被整個跳過,不會再被拿去跟後面的錨點比對,省下不少昂貴的
+    # 位移投票/精修運算。
+    assigned = [False] * n
+    total_pairs_estimate = n * (n - 1) // 2  # 只用來給進度條一個大致分母,不追求精確
     done_pairs = 0
     last_emit = 0.0
+    result = []
     for i in range(n):
         if cancelled():
             return []
+        if assigned[i]:
+            continue
+        assigned[i] = True
         va = videos[i]
+        members = [i]
+        segments = []
         for j in range(i + 1, n):
+            if assigned[j]:
+                continue
             done_pairs += 1
             if progress_cb:
                 now = time.monotonic()
                 if now - last_emit >= PROGRESS_TIME_INTERVAL:
                     last_emit = now
-                    progress_cb(2, done_pairs, total_pairs, va["path"])
+                    progress_cb(2, done_pairs, total_pairs_estimate, va["path"])
             vb = videos[j]
             both_fine = va["interval"] <= base_interval * 1.0001 and vb["interval"] <= base_interval * 1.0001
 
@@ -489,22 +528,14 @@ def find_similar_videos(
                 if matched_sec < min_match_seconds:
                     continue
 
-            uf.union(i, j)
-            seg = (
+            assigned[j] = True
+            members.append(j)
+            segments.append(
                 f"{os.path.basename(va['path'])} {_fmt_ts(fa0)}–{_fmt_ts(fa1)}"
                 f"  ≈  {os.path.basename(vb['path'])} {_fmt_ts(fb0)}–{_fmt_ts(fb1)}"
             )
-            pair_detail[(i, j)] = seg
 
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        groups.setdefault(uf.find(i), []).append(i)
+        if len(members) >= 2:
+            result.append({"paths": [videos[idx]["path"] for idx in members], "segments": segments})
 
-    result = []
-    for members in groups.values():
-        if len(members) < 2:
-            continue
-        member_set = set(members)
-        segments = [seg for (i, j), seg in pair_detail.items() if i in member_set and j in member_set]
-        result.append({"paths": [videos[i]["path"] for i in members], "segments": segments})
     return result

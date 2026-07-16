@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTreeWidget,
@@ -21,7 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import analysis, theme
-from ..utils.fs import display_path, format_size, list_drives
+from ..utils.fs import display_path, format_size, list_drives, wrap_path_for_label
 from ..widgets.neon_progress import NeonProgressBar
 from ..workers import DupeWorker
 from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, safe_trash_delete
@@ -277,6 +278,9 @@ class DupePage(QWidget):
         self._preview_meta = QLabel("")
         self._preview_meta.setStyleSheet(f"color: {theme.TEXT_DIM}; font-family: Consolas; font-size: 9pt;")
         self._preview_meta.setWordWrap(True)
+        # 檔案路徑沒有空白給 word-wrap 找斷點,不設這個的話整個面板會被撐到跟路徑一樣寬、
+        # 分隔線怎麼拖都縮不小(見 wrap_path_for_label 的說明)。
+        self._preview_meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self._preview_image)
         layout.addWidget(self._preview_meta)
         layout.addStretch(1)
@@ -409,7 +413,8 @@ class DupePage(QWidget):
             self._preview_image.setText("(不支援預覽)" if ext in analysis.VIDEO_EXTS else "無法預覽")
 
         self._preview_meta.setText(
-            f"{os.path.basename(path)}\n大小:{format_size(data['size'])}\n修改日期:{analysis.format_relative_time(data['mtime'])}\n{path}"
+            f"{os.path.basename(path)}\n大小:{format_size(data['size'])}\n"
+            f"修改日期:{analysis.format_relative_time(data['mtime'])}\n{wrap_path_for_label(path)}"
         )
 
     def _iter_checked_entries(self):
