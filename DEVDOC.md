@@ -530,9 +530,11 @@ def atime_reliable(drive_root: str) -> bool:
 
 三階段漏斗(效率關鍵,不要跳步):
 
-1. **依大小分組**:`safe_walk` 收集 `(size → [paths])`,只保留同大小 ≥ 2 個且 size ≥ 門檻的組。此階段只讀 metadata 不讀內容。
+1. **依大小分組**:`safe_walk` 收集 `size → paths`,只保留同大小 ≥ 2 個且 size ≥ 門檻的組。此階段只讀 metadata 不讀內容。**記憶體**:整碟掃描絕大多數大小是單例,dict 值用「先存單一字串、第二次撞到同大小才升級成 list」,避免每個單例都揹一個 list 物件。
 2. **前 4 KB 快速雜湊**:同組內讀每檔前 4096 bytes 算 `hashlib.blake2b`,再分組,淘汰不同者。
-3. **全檔雜湊**:剩餘的以 1 MB chunk 迭代算 blake2b。讀檔全程 try/except,讀不到就踢出該組。
+3. **全檔雜湊**:剩餘的以 1 MB chunk 迭代算 blake2b。讀檔全程 try/except,讀不到就踢出該組。**大檔雜湊要能中途取消**:cancel 檢查放進 chunk 讀取迴圈裡(不是只在檔案之間),否則雜湊一個數十 GB 的映像檔期間按取消要等整個檔案跑完。
+
+**硬連結去重(在最後成組時做,不在階段 1)**:pnpm 全域 store、部分系統檔會讓同一份實體資料(`st_dev, st_ino`)出現在多個路徑,它們必然 byte 相同而落在同組,但刪任一個都不會釋放空間(「可省 X GB」會造假)、還白白重複讀取。**不能在階段 1 做**:Windows 上 `os.scandir` 的 `DirEntry.stat` 回傳的 `st_nlink`/`st_ino` 都是 0(用廉價的目錄掃描資料),拿不到硬連結資訊;對全碟每個檔案都改用 `os.stat`(能拿到真值)太貴。改在最後把已確定 byte 相同的少數候選,用 `os.stat` 取 `(st_dev, st_ino)` 去重、每個 inode 只留一個代表(`st_ino` 為 0 的卷不去重、照常保留)。
 
 進度 UI 要顯示目前階段:「第 1/3 階段:比對檔案大小(已掃 N 檔)」→「第 2/3 階段:快速比對(M 組候選)」→「第 3/3 階段:完整雜湊(第 i/j 檔)」。第 3 階段有明確分母,用真實百分比進度條。
 
@@ -587,6 +589,11 @@ def atime_reliable(drive_root: str) -> bool:
   3. **任一邊被放寬過(牽涉到長片)**:改用 **位移投票**(`_estimate_offset`):不要求兩邊取樣點對齊到同一個網格相位(兩邊各自從 t=0 取樣,真正的重疊位移是未知數、不會剛好是取樣間隔的整數倍,硬要對齊網格反而讓兩邊取樣點集合幾乎不重疊而找不到匹配——這是實作時踩到的一個坑,類比 Shazam 音訊指紋的做法改成位移投票才修好);粗篩比對抓出「哪些樣本對內容相近」,每一對估出一個位移量,投票選出票數最高的候選,再把短的那部投影到長的那部時間軸上,得到候選重疊窗。
   4. **精修** `_refine_match`:只在候選窗附近(留 margin)重新用 `base_interval` 密集取樣兩段短內容、重新跑一次(範圍小、成本低的)Smith-Waterman,拿到精確到秒的邊界,同時二次驗證排除粗篩階段的巧合匹配。`min_match_seconds`(最短連續相似秒數)在這裡把關,過濾黑畫面/共用片頭之類的巧合。
   - 非 ASCII 路徑後援:`GetShortPathNameW` 取 8.3 短路徑重試。效能:粗篩樣本數固定(≤ max_samples),DP 成本不隨影片長度增長;精修只在候選窗這種小範圍內重新解碼,不必為了長片全片精細比對而讓運算量爆炸。
+  - **`_refine_match` 精修窗必須有樣本上限(別再拿掉)**:候選窗長度沒有先天上限——兩部都是長片、offset≈0 時窗長會逼近整片。若固定用 `base_interval` 密集取樣,解碼次數(每秒一次 seek)與 `_local_align` 的 O(na·nb) 純 Python DP 會隨窗長無上限爆掉(兩部 60 分鐘影片 = 3600×3600 DP + 數千次 seek,記憶體數百 MB、單一對就要數分鐘)。所以精修間隔依窗長自動放寬,確保兩邊取樣數都 ≤ `VIDEO_REFINE_MAX_SAMPLES`(600):窗短維持秒級精度、長窗退到幾秒精度(顯示相似區間夠用)。這是跟粗篩 `max_samples` 同性質的「把無上界變有界」保護。
+  - **相似秒數用「真正對到的幀數」而非「對齊跨度」**:`_local_align` 回傳的 `match_count` 是最佳區段回溯路徑上真正 match 的幀數;`matched_sec = match_count × interval`。Smith-Waterman 的區段裡可以夾雜 mismatch/gap,用跨度當相似時間會高估、放進假匹配,用實際對到的幀數才擋得住「跨度長但一堆錯配」的巧合(比舊的跨度版更嚴,不會更寬鬆)。
+  - **`image_dhash` 用 `IMREAD_REDUCED_GRAYSCALE_8` 先 1/8 解碼**再 resize 到 9×8(大 JPEG 快數倍;縮完任一邊 < 9 才退回全解析度重解)。**注意這不是無損替換**:縮小解碼與全解析度解碼的 dHash 不保證逐 bit 相同(INTER_AREA 來源像素不同),差異僅一兩 bit、遠在門檻內——是速度/精度取捨,跟 `_popcount` 那次(完全等價)不同。
+  - **退化指紋直接跳過**:純色圖 dHash 全 0、平滑漸層可能全 1,鑑別力極低(純黑圖彼此距離恆 0),`popcount` 落在 `[IMAGE_DEGENERATE_POPCOUNT, 64-IMAGE_DEGENERATE_POPCOUNT]` 之外的不納入分群,避免製造假群組。
+  - **完全相同的 dHash 先摺疊再分群**:O(n²) 錨點分群前先把相同指紋收成同一桶,只對「相異指紋的代表」跑分群,完全重複的圖(重存/重複下載很常見)可大幅縮小 n;距離保證不變(代表 ≤ threshold、桶內成員 = 0,同組任兩張 ≤ threshold×2)。
   - **`_popcount_u64` 用 `np.bitwise_count`(numpy>=2.0)算,不要改回 `np.unpackbits`**:實測後者慢約 240 倍,兩兩比對是這個模組最熱的路徑,大型影片庫(千部等級)會從小時等級的等待時間變成分鐘等級。numpy<2.0 環境有 unpackbits 版本的後援實作。
   - **階段 1 平行解碼**:`find_similar_videos` 先用 `safe_walk` 蒐集完所有影片路徑(快、事先知道總數),再用 `ThreadPoolExecutor(max_workers=VIDEO_FINGERPRINT_WORKERS)`(預設 4)平行呼叫 `build_video_print`。實測 cv2 的解碼呼叫確實會釋放 GIL,執行緒能拿到真實加速(不需要換成多程序,省掉 IPC/pickle 的複雜度)。worker 數刻意保守——傳統硬碟上開太多平行 seek 反而會互相拖累,4 是加速與 HDD 友善之間的折衷,沒有做成 UI 可調選項。取消時呼叫 `executor.shutdown(wait=False, cancel_futures=True)` 取消還沒開始跑的工作。副作用:`videos` 清單順序不再等於目錄走訪順序(誰先解完誰先進清單),不影響階段 2 分群正確性,只是同一組裡「哪個檔案是錨點/顯示在前面」不再固定。
   - **階段 2 分群演算法**:跟圖片那邊同一個理由,一樣改用**錨點分群**(不是 Union-Find):依序把還沒分組的影片當錨點,只跟它比對,已分組的影片直接跳過(不會再被拿去測試),省下不少昂貴的位移投票/精修運算。影片理論上一樣有 Union-Find 遞移合併的長鏈風險(雖然因為要求真的有時間軸對齊,實務上機率比圖片低很多),為了一致性與正確性保證一併修掉。
@@ -603,11 +610,11 @@ def atime_reliable(drive_root: str) -> bool:
 
 補足 §8.1 大檔案掃描抓不到「一堆小檔案加起來很肥的資料夾」的盲點,用 WinDirStat 式 treemap 以**面積**呈現佔用。純邏輯層 `treemap.py` 不碰 Qt;Qt 層在 `workers.TreeSizeWorker` + 自訂 `QPainter` 繪圖 widget `TreemapView`。零新依賴。
 
-- `build_size_tree(targets)`:遞迴 `os.scandir`(安全性比照 `safe_walk`:不進 reparse point、命中 `EXCLUDED_DIRS` 不下探、OSError 跳過),但**保留階層結構**;資料夾 size = 子節點加總(bottom-up)。Node 為 dict `{path,name,size,is_dir,children,aggregate?}`。
+- `build_size_tree(targets)`:**顯式堆疊後序走訪(不遞迴)** `os.scandir`(安全性比照 `safe_walk`:不進 reparse point、命中 `EXCLUDED_DIRS` 不下探、OSError 跳過),但**保留階層結構**;資料夾 size = 子節點加總(bottom-up)。Node 為 dict `{path,name,size,is_dir,children,aggregate?}`。**刻意不用遞迴**:超深目錄樹(失控程式狂建 `a\a\a\...`)會撞 Python 遞迴上限,`RecursionError` 不是 `OSError`、不會被內層 except 接住,會一路穿出去卡死掃描(safe_walk 早就是 iterative,treemap 一併看齊)。
 - `top_children(node, limit)`:只取前 limit 大的子節點,其餘併成「其他 N 項」聚合節點,避免對含數萬檔案的資料夾一次鋪出數萬個小矩形。
 - `squarify(nodes, rect)`:Squarified treemap(Bruls et al. 2000),同層依 size 遞迴切割矩形、盡量正方形。**只鋪當前層級一層**,下鑽時對子樹重算,不預先鋪整棵樹。
 - `TreemapView`:`paintEvent` 逐塊 `fillRect` + 標籤,顏色複用 `analysis.classify` 的類型分類(資料夾另有專色);左鍵點資料夾**下鑽**、頂部麵包屑回上層、hover 顯示完整路徑 + 大小、右鍵「開啟位置」。**不提供刪除**(純檢視,要刪去 §8.1/§8.3)。
-- 記憶體:整碟掃描會把整棵樹留在記憶體,節點多時較吃記憶體——靠「指定資料夾範圍」(§8.7 註)縮小是主要的壓力釋放閥。
+- 記憶體:整碟掃描把整棵樹留在記憶體。主要壓力來自**檔案節點**(數量遠多於資料夾),故建樹時每個資料夾只用有界 min-heap 留前 `FILE_CAP`(200)大的檔案節點、其餘併成「其他 N 個檔案」聚合節點(反正顯示端 `top_children` 也只鋪前 120 大);含數十萬檔案的資料夾記憶體可差一個數量級。資料夾節點不設上限(下鑽需要完整階層)。搭配「指定資料夾範圍」(§8.7 註)進一步縮小。
 
 > **§8 共用:掃描範圍不限整碟(`views/common.py::FolderPicker`)。** dupe/bigfile/treemap/similarity 四個掃描頁都可用磁碟 chips 之外的 `FolderPicker` 指定任意資料夾(含子目錄)當掃描根,清單非空時改掃指定資料夾、否則掃勾選磁碟。底層 `safe_walk` / `build_size_tree` 對「磁碟根」或「任意資料夾路徑」一視同仁,故只是 UI 傳不同的 `targets: list[str]`。注意 bigfile 的 atime 可靠性查表要用**磁碟代號**還原(`targets` 可能是子資料夾),見 `bigfile_page._start_scan`。
 
@@ -645,6 +652,8 @@ def relaunch_as_admin():
 - Worker 執行緒碰 QWidget = 隨機崩潰。只准 emit signal。
 - Signal 每檔案都發 = UI 凍結。**節流:每 200 檔或 100ms 一次。**
 - 執行緒收尾用 §6 的樣板(`quit` + `deleteLater`),否則關窗時 `QThread: Destroyed while thread is still running` 崩潰。視窗 `closeEvent` 要先 cancel 並 `thread.wait(2000)`。
+- **每個 worker 的 `run()` 最外層一定要 `try/finally`,`finally` 裡保證 emit `finished`(帶預設空結果)**:任何未預期例外若讓 `finished` 不發出,`thread.quit()` 就不會被呼叫 → UI 永遠卡在掃描頁、取消鈕失效,關窗時 `wait(2000)` 逾時後 QThread 在執行中被銷毀而崩潰。有 `error` signal 的 worker(如 `SimilarityWorker`)順便把訊息回報 UI;逐項目的 worker(掃描/清理各模組)則 per-item catch、給 UI 一個標記 error 的空結果後繼續下一個,不讓單一壞項目拖垮整輪。
+- **長迴圈的取消要放在真正耗時的內層**,不能只在項目之間:全檔雜湊放進 chunk 讀取迴圈、影片分群的內層 `for j`(每對可能觸發精修解碼)、`_sample_window` 的取樣迴圈都要檢查取消旗標,否則 `wait(2000)` 等不到、關窗崩潰的風險仍在。
 
 ### 10.2 QSS 限制
 - QSS 沒有 `box-shadow`、`text-shadow`、`transition`。發光只能用 `QGraphicsDropShadowEffect`,動畫用 `QPropertyAnimation`。

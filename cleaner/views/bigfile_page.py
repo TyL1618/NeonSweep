@@ -315,7 +315,9 @@ class BigFilePage(QWidget):
             self._table.setItem(r, COL_ROLE, QTableWidgetItem(row["role"]))
             self._table.setItem(r, COL_NAME, QTableWidgetItem(os.path.basename(row["path"])))
             path_item = QTableWidgetItem(display_path(row["path"]))
-            path_item.setData(Qt.ItemDataRole.UserRole, row["path"])
+            # 存整個 row dict(不只 path):勾選統計/刪除時直接取用,免得每列都對 self._rows 線性
+            # 搜尋(全選 200 列 = 200×200 次比對)。排序時 UserRole 資料會跟著 item 一起搬,安全。
+            path_item.setData(Qt.ItemDataRole.UserRole, row)
             self._table.setItem(r, COL_PATH, path_item)
 
             atime_text = analysis.format_relative_time(row["atime"]) if row["atime"] else "—"
@@ -373,7 +375,8 @@ class BigFilePage(QWidget):
 
     def _row_by_path(self, path: str) -> int | None:
         for r in range(self._table.rowCount()):
-            if self._table.item(r, COL_PATH).data(Qt.ItemDataRole.UserRole) == path:
+            data = self._table.item(r, COL_PATH).data(Qt.ItemDataRole.UserRole)
+            if data and data["path"] == path:
                 return r
         return None
 
@@ -406,8 +409,7 @@ class BigFilePage(QWidget):
         total_size = 0
         for r in range(self._table.rowCount()):
             if self._table.item(r, COL_CHECK).checkState() == Qt.CheckState.Checked:
-                path = self._table.item(r, COL_PATH).data(Qt.ItemDataRole.UserRole)
-                row_data = next((x for x in self._rows if x["path"] == path), None)
+                row_data = self._table.item(r, COL_PATH).data(Qt.ItemDataRole.UserRole)
                 if row_data:
                     checked_paths.append(row_data)
                     total_size += row_data["size"]
@@ -446,8 +448,7 @@ class BigFilePage(QWidget):
         for r in range(self._table.rowCount()):
             check_item = self._table.item(r, COL_CHECK)
             if check_item and check_item.checkState() == Qt.CheckState.Checked:
-                path = self._table.item(r, COL_PATH).data(Qt.ItemDataRole.UserRole)
-                row_data = next((x for x in self._rows if x["path"] == path), None)
+                row_data = self._table.item(r, COL_PATH).data(Qt.ItemDataRole.UserRole)
                 if row_data:
                     count += 1
                     total += row_data["size"]
@@ -462,14 +463,16 @@ class BigFilePage(QWidget):
         row = self._table.rowAt(pos.y())
         if row < 0:
             return
-        path = self._table.item(row, COL_PATH).data(Qt.ItemDataRole.UserRole)
+        data = self._table.item(row, COL_PATH).data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
         menu = QMenu(self)
         copy_action = menu.addAction("複製路徑")
         action = menu.exec(self._table.viewport().mapToGlobal(pos))
         if action == copy_action:
             from PyQt6.QtWidgets import QApplication
 
-            QApplication.clipboard().setText(path)
+            QApplication.clipboard().setText(data["path"])
 
 
 def _qcolor(hex_color: str):

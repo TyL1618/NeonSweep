@@ -5,7 +5,8 @@ send2trash 安全刪除(含刪前重新驗證)、確認對話框。不屬於 DEV
 
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QImageReader, QPixmap
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
@@ -24,6 +25,28 @@ from .. import theme
 from ..utils.fs import display_path
 
 HUGE_FILE_THRESHOLD = 10 * 1024**3  # 10 GB,見 DEVDOC §5 規則 7
+
+
+def load_thumbnail(path: str, max_side: int = 320):
+    """讀圖並縮成最長邊 max_side 的縮圖 QPixmap;失敗回傳 None。
+
+    用 QImageReader.setScaledSize 在「解碼階段」就縮小(JPEG 走快速縮小解碼路徑),先讀標頭拿到
+    原尺寸、只在需要時設定縮放,避免像 QPixmap(path) 那樣把整張大圖(可能上億像素、數百 MB)整個
+    載進記憶體再 scaled——那會讓 GUI 執行緒卡頓、記憶體瞬間暴衝。QImageReader 吃 Unicode 路徑,
+    非 ASCII 路徑不像 cv2.imread 會失敗。
+    """
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()  # 只讀標頭、不解碼
+    if size.isValid() and size.width() > 0 and size.height() > 0:
+        w, h = size.width(), size.height()
+        if w > max_side or h > max_side:
+            scale = min(max_side / w, max_side / h)
+            reader.setScaledSize(QSize(max(1, int(w * scale)), max(1, int(h * scale))))
+    img = reader.read()
+    if img.isNull():
+        return None
+    return QPixmap.fromImage(img)
 
 
 class NeonChip(QPushButton):

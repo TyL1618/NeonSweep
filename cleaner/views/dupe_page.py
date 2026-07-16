@@ -25,9 +25,11 @@ from .. import analysis, theme
 from ..utils.fs import display_path, format_size, list_drives, wrap_path_for_label
 from ..widgets.neon_progress import NeonProgressBar
 from ..workers import DupeWorker
-from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, safe_trash_delete
+from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, load_thumbnail, safe_trash_delete
 
 PATH_ELIDE_WIDTH = 480
+MAX_RENDERED_GROUPS = 500  # 結果樹一次最多鋪幾組(依可省空間遞減取前段);其餘只計數,避免低門檻整碟
+                            # 掃描炸出數萬組、每組還掛兩顆按鈕把 QTreeWidget 建到卡死(比照清理頁 500 筆上限)
 MIN_SIZE_OPTIONS = [("500 KB", 500 * 1024), ("1 MB", 1024 * 1024), ("10 MB", 10 * 1024 * 1024), ("100 MB", 100 * 1024 * 1024)]
 TYPE_FILTERS = [
     ("all", "全部"),
@@ -313,12 +315,16 @@ class DupePage(QWidget):
         self._tree.itemChanged.disconnect(self._on_item_changed)
         self._tree.clear()
 
-        total_freed = 0
-        for group in self._groups:
+        # 總可釋放大小用「全部組」誠實計算,但只鋪前 MAX_RENDERED_GROUPS 組(依可省空間遞減)。
+        total_freed = sum((len(g) - 1) * g[0]["size"] for g in self._groups)
+        render_groups = sorted(self._groups, key=lambda g: (len(g) - 1) * g[0]["size"], reverse=True)
+        truncated = len(render_groups) > MAX_RENDERED_GROUPS
+        render_groups = render_groups[:MAX_RENDERED_GROUPS]
+
+        for group in render_groups:
             size = group[0]["size"]
             n = len(group)
             freed = (n - 1) * size
-            total_freed += freed
             top = QTreeWidgetItem([f"{n} 個相同檔案 × 每個 {format_size(size)},可省 {format_size(freed)}", ""])
             top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             self._tree.addTopLevelItem(top)
@@ -353,7 +359,10 @@ class DupePage(QWidget):
 
             top.setExpanded(True)
 
-        self._summary_label.setText(f"共 {len(self._groups)} 組重複,合計可釋放 {format_size(total_freed)}")
+        summary = f"共 {len(self._groups)} 組重複,合計可釋放 {format_size(total_freed)}"
+        if truncated:
+            summary += f"(僅顯示可省空間最大的前 {MAX_RENDERED_GROUPS} 組)"
+        self._summary_label.setText(summary)
         self._tree.itemChanged.connect(self._on_item_changed)
         self._check_guard()
 
@@ -363,8 +372,13 @@ class DupePage(QWidget):
             return
         target = min(children, key=lambda c: c.data(0, Qt.ItemDataRole.UserRole)["mtime"]) if keep_oldest else \
             max(children, key=lambda c: c.data(0, Qt.ItemDataRole.UserRole)["mtime"])
+        # 一次改多個勾選狀態:先擋掉 itemChanged,避免每改一個就觸發一次全樹 _check_guard(k 次
+        # O(N) 掃描),改完再手動檢查一次即可。
+        self._tree.blockSignals(True)
         for c in children:
             c.setCheckState(0, Qt.CheckState.Unchecked if c is target else Qt.CheckState.Checked)
+        self._tree.blockSignals(False)
+        self._check_guard()
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         self._check_guard()
@@ -400,13 +414,12 @@ class DupePage(QWidget):
         path = data["path"]
         ext = os.path.splitext(path)[1].lower()
         if ext in analysis.IMAGE_EXTS:
-            pix = QPixmap(path)
-            if pix.isNull():
+            pix = load_thumbnail(path, 320)
+            if pix is None:
                 self._preview_image.setText("無法預覽")
                 self._preview_image.setPixmap(QPixmap())
             else:
-                scaled = pix.scaled(320, 320, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                self._preview_image.setPixmap(scaled)
+                self._preview_image.setPixmap(pix)
                 self._preview_image.setText("")
         else:
             self._preview_image.setPixmap(QPixmap())

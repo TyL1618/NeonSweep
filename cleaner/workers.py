@@ -1,7 +1,10 @@
+import traceback
+
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from . import analysis, diagnostics, smart_health, treemap
 from .modules.base import ScanCancelled
+from .state import CleanResult, ScanResult
 
 
 class ScanWorker(QObject):
@@ -31,18 +34,27 @@ class ScanWorker(QObject):
         return cb
 
     def run(self):
-        for m in self._modules:
-            if self._cancelled:
-                break
-            self.module_started.emit(m.module_id)
-            try:
-                result = m.scan(self._make_cb(m.module_id))
-            except ScanCancelled:
-                # 安全網:萬一某模組的自訂迴圈忘了自己接住 ScanCancelled,
-                # 這裡確保 finished 訊號一定會發出,執行緒才能正常收尾。
-                break
-            self.module_finished.emit(m.module_id, result)
-        self.finished.emit()
+        # 最外層 try/finally:任何未預期例外都不能讓 finished 不發出,否則 thread.quit() 不會被
+        # 呼叫、UI 永遠卡在掃描頁、取消鈕失效,關窗時 wait(2000) 逾時後 QThread 在執行中被銷毀而崩潰。
+        try:
+            for m in self._modules:
+                if self._cancelled:
+                    break
+                self.module_started.emit(m.module_id)
+                try:
+                    result = m.scan(self._make_cb(m.module_id))
+                except ScanCancelled:
+                    # 安全網:萬一某模組的自訂迴圈忘了自己接住 ScanCancelled。
+                    break
+                except Exception:
+                    # 單一模組掃描出未預期錯誤:記下來、給 UI 一個空結果(標記 error),繼續下一個,
+                    # 不讓一個壞模組拖垮整輪掃描。
+                    traceback.print_exc()
+                    self.module_finished.emit(m.module_id, ScanResult(module_id=m.module_id, error_count=1))
+                    continue
+                self.module_finished.emit(m.module_id, result)
+        finally:
+            self.finished.emit()
 
 
 class CleanWorker(QObject):
@@ -71,16 +83,24 @@ class CleanWorker(QObject):
         return cb
 
     def run(self):
-        for module, scan_result in self._jobs:
-            if self._cancelled:
-                break
-            self.module_started.emit(module.module_id)
-            try:
-                result = module.clean(scan_result, self._make_cb(module.module_id))
-            except ScanCancelled:
-                break
-            self.module_finished.emit(module.module_id, result)
-        self.finished.emit()
+        try:
+            for module, scan_result in self._jobs:
+                if self._cancelled:
+                    break
+                self.module_started.emit(module.module_id)
+                try:
+                    result = module.clean(scan_result, self._make_cb(module.module_id))
+                except ScanCancelled:
+                    break
+                except Exception:
+                    traceback.print_exc()
+                    self.module_finished.emit(
+                        module.module_id, CleanResult(module_id=module.module_id, errors=["未預期錯誤,已略過"])
+                    )
+                    continue
+                self.module_finished.emit(module.module_id, result)
+        finally:
+            self.finished.emit()
 
 
 class BigFileWorker(QObject):
@@ -103,13 +123,18 @@ class BigFileWorker(QObject):
         return self._cancelled
 
     def run(self):
-        result = analysis.scan_top_files(
-            self._drives,
-            progress_cb=lambda count, path: self.progress.emit(count, path),
-            cancel_check=lambda: self._cancelled,
-            top_n=self._top_n,
-        )
-        self.finished.emit(result)
+        result = []
+        try:
+            result = analysis.scan_top_files(
+                self._drives,
+                progress_cb=lambda count, path: self.progress.emit(count, path),
+                cancel_check=lambda: self._cancelled,
+                top_n=self._top_n,
+            )
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.finished.emit(result)
 
 
 class DupeWorker(QObject):
@@ -133,14 +158,19 @@ class DupeWorker(QObject):
         return self._cancelled
 
     def run(self):
-        result = analysis.find_duplicates(
-            self._drives,
-            self._extensions,
-            self._min_size,
-            progress_cb=lambda phase, done, total, path: self.progress.emit(phase, done, total, path),
-            cancel_check=lambda: self._cancelled,
-        )
-        self.finished.emit(result)
+        result = []
+        try:
+            result = analysis.find_duplicates(
+                self._drives,
+                self._extensions,
+                self._min_size,
+                progress_cb=lambda phase, done, total, path: self.progress.emit(phase, done, total, path),
+                cancel_check=lambda: self._cancelled,
+            )
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.finished.emit(result)
 
 
 class DevSpaceWorker(QObject):
@@ -162,12 +192,17 @@ class DevSpaceWorker(QObject):
         return self._cancelled
 
     def run(self):
-        result = analysis.find_devspaces(
-            self._drives,
-            progress_cb=lambda path: self.progress.emit(path),
-            cancel_check=lambda: self._cancelled,
-        )
-        self.finished.emit(result)
+        result = []
+        try:
+            result = analysis.find_devspaces(
+                self._drives,
+                progress_cb=lambda path: self.progress.emit(path),
+                cancel_check=lambda: self._cancelled,
+            )
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.finished.emit(result)
 
 
 class TreeSizeWorker(QObject):
@@ -189,12 +224,17 @@ class TreeSizeWorker(QObject):
         return self._cancelled
 
     def run(self):
-        result = treemap.build_size_tree(
-            self._targets,
-            progress_cb=lambda count, path: self.progress.emit(count, path),
-            cancel_check=lambda: self._cancelled,
-        )
-        self.finished.emit(result)
+        result = None
+        try:
+            result = treemap.build_size_tree(
+                self._targets,
+                progress_cb=lambda count, path: self.progress.emit(count, path),
+                cancel_check=lambda: self._cancelled,
+            )
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.finished.emit(result)
 
 
 class SimilarityWorker(QObject):
@@ -231,21 +271,27 @@ class SimilarityWorker(QObject):
 
         emit = lambda phase, done, total, path: self.progress.emit(phase, done, total, path)
         cancel = lambda: self._cancelled
-        if self._mode == "video":
-            raw = similarity.find_similar_videos(
-                self._targets,
-                min_match_seconds=self._min_match_seconds,
-                frame_threshold=self._threshold,
-                progress_cb=emit,
-                cancel_check=cancel,
-            )
-            result = [{"paths": d["paths"], "segments": d["segments"], "kind": "video"} for d in raw]
-        else:
-            raw = similarity.find_similar_images(
-                self._targets, threshold=self._threshold, progress_cb=emit, cancel_check=cancel
-            )
-            result = [{"paths": g, "segments": [], "kind": "image"} for g in raw]
-        self.finished.emit(result)
+        result = []
+        try:
+            if self._mode == "video":
+                raw = similarity.find_similar_videos(
+                    self._targets,
+                    min_match_seconds=self._min_match_seconds,
+                    frame_threshold=self._threshold,
+                    progress_cb=emit,
+                    cancel_check=cancel,
+                )
+                result = [{"paths": d["paths"], "segments": d["segments"], "kind": "video"} for d in raw]
+            else:
+                raw = similarity.find_similar_images(
+                    self._targets, threshold=self._threshold, progress_cb=emit, cancel_check=cancel
+                )
+                result = [{"paths": g, "segments": [], "kind": "image"} for g in raw]
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(f"相似偵測發生未預期錯誤:{e}")
+        finally:
+            self.finished.emit(result)
 
 
 class DiagnosticWorker(QObject):
@@ -273,34 +319,35 @@ class DiagnosticWorker(QObject):
         return self._cancelled
 
     def run(self):
-        for key, checker in (
-            ("winsxs", diagnostics.winsxs_size),
-            ("driverstore", diagnostics.driverstore_size),
-        ):
+        try:
+            for key, checker in (
+                ("winsxs", diagnostics.winsxs_size),
+                ("driverstore", diagnostics.driverstore_size),
+            ):
+                if self._cancelled:
+                    return
+                self.category_started.emit(key)
+                size, count, complete = checker(
+                    progress_cb=lambda c, b, k=key: self.progress.emit(k, c, b),
+                    cancel_check=self._cancel_check,
+                )
+                self.category_finished.emit(key, {"size": size, "count": count, "complete": complete})
+
             if self._cancelled:
-                self.finished.emit()
                 return
-            self.category_started.emit(key)
-            size, count, complete = checker(
-                progress_cb=lambda c, b, k=key: self.progress.emit(k, c, b),
-                cancel_check=self._cancel_check,
-            )
-            self.category_finished.emit(key, {"size": size, "count": count, "complete": complete})
 
-        if self._cancelled:
+            self.category_started.emit("hiberfil")
+            self.category_finished.emit("hiberfil", {"size": diagnostics.hibernation_file_size()})
+
+            self.category_started.emit("pagefile")
+            self.category_finished.emit("pagefile", {"size": diagnostics.pagefile_size()})
+
+            self.category_started.emit("shadow_copy")
+            self.category_finished.emit("shadow_copy", {"size": diagnostics.shadow_copy_used_size()})
+        except Exception:
+            traceback.print_exc()
+        finally:
             self.finished.emit()
-            return
-
-        self.category_started.emit("hiberfil")
-        self.category_finished.emit("hiberfil", {"size": diagnostics.hibernation_file_size()})
-
-        self.category_started.emit("pagefile")
-        self.category_finished.emit("pagefile", {"size": diagnostics.pagefile_size()})
-
-        self.category_started.emit("shadow_copy")
-        self.category_finished.emit("shadow_copy", {"size": diagnostics.shadow_copy_used_size()})
-
-        self.finished.emit()
 
 
 class SmartHealthWorker(QObject):
@@ -321,18 +368,22 @@ class SmartHealthWorker(QObject):
         return self._cancelled
 
     def run(self):
-        for dev in smart_health.scan_devices():
-            if self._cancelled:
-                break
-            device = dev.get("name")
-            if not device:
-                continue
-            dev_type = dev.get("type")
-            health = smart_health.query_health(device, dev_type) or {
-                "device": device,
-                "type": dev_type,
-                "model": device,
-                "passed": None,
-            }
-            self.device_found.emit(health)
-        self.finished.emit()
+        try:
+            for dev in smart_health.scan_devices():
+                if self._cancelled:
+                    break
+                device = dev.get("name")
+                if not device:
+                    continue
+                dev_type = dev.get("type")
+                health = smart_health.query_health(device, dev_type) or {
+                    "device": device,
+                    "type": dev_type,
+                    "model": device,
+                    "passed": None,
+                }
+                self.device_found.emit(health)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.finished.emit()

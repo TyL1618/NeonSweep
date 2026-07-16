@@ -138,13 +138,22 @@ def delete_entries(
     except ScanCancelled:
         pass
 
+    # 空目錄清理:由深到淺。刪掉一層後父目錄可能也空了(%TEMP%\a\b\file 刪掉後 b 空了、b 刪掉後
+    # a 也空了),所以每刪成功一層就往上再試,直到父目錄非空(rmdir 丟 OSError)或碰到 allowed_root
+    # 邊界為止——絕不刪 allowed_root 本身。rmdir 只會刪空目錄,即使某層還有尚未處理的兄弟子目錄,
+    # 這一層就 rmdir 失敗、停在該層,不會誤刪(等兄弟被清空後,由那條路徑的往上迭代再收掉)。
+    allowed_norm = {os.path.normcase(os.path.abspath(root).rstrip(os.sep)) for root in allowed_roots}
     for d in sorted(touched_dirs, key=len, reverse=True):
-        if any(os.path.normcase(d) == os.path.normcase(os.path.abspath(root).rstrip(os.sep)) for root in allowed_roots):
-            continue
-        try:
-            os.rmdir(long_path(d) if len(d) > 250 else d)
-        except OSError:
-            pass
+        cur = d
+        while cur and os.path.normcase(cur) not in allowed_norm:
+            try:
+                os.rmdir(long_path(cur) if len(cur) > 250 else cur)
+            except OSError:
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
 
     return freed_bytes, deleted_count, skipped_count, errors, log_lines
 

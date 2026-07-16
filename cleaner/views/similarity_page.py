@@ -29,9 +29,10 @@ from .. import analysis, theme
 from ..utils.fs import display_path, format_size, list_drives, wrap_path_for_label
 from ..widgets.neon_progress import NeonProgressBar
 from ..workers import SimilarityWorker
-from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, safe_trash_delete
+from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, load_thumbnail, safe_trash_delete
 
 PATH_ELIDE_WIDTH = 480
+MAX_RENDERED_GROUPS = 500  # 結果樹一次最多鋪幾組(依最大檔案遞減取前段);其餘只計數,避免建到卡死
 TYPE_FILTERS = [("image", "圖片"), ("video", "影片")]
 
 # 圖片:(標籤, Hamming 門檻)——兩張圖的 64-bit dHash 指紋逐 bit 比對,不同的 bit 數 <= 門檻才算相似。
@@ -346,7 +347,12 @@ class SimilarityPage(QWidget):
         self._tree.itemChanged.disconnect(self._on_item_changed)
         self._tree.clear()
 
-        for group, segments in zip(self._groups, self._group_segments):
+        pairs = list(zip(self._groups, self._group_segments))
+        pairs.sort(key=lambda gs: max(e["size"] for e in gs[0]), reverse=True)
+        truncated = len(pairs) > MAX_RENDERED_GROUPS
+        pairs = pairs[:MAX_RENDERED_GROUPS]
+
+        for group, segments in pairs:
             n = len(group)
             largest = max(e["size"] for e in group)
             top = QTreeWidgetItem([f"{n} 個相似檔案(最大 {format_size(largest)})", ""])
@@ -384,7 +390,10 @@ class SimilarityPage(QWidget):
 
             top.setExpanded(True)
 
-        self._summary_label.setText(f"共 {len(self._groups)} 組相似檔案")
+        summary = f"共 {len(self._groups)} 組相似檔案"
+        if truncated:
+            summary += f"(僅顯示最大檔案排前 {MAX_RENDERED_GROUPS} 組)"
+        self._summary_label.setText(summary)
         self._tree.itemChanged.connect(self._on_item_changed)
         self._check_guard()
 
@@ -403,8 +412,12 @@ class SimilarityPage(QWidget):
             return
         key = lambda c: c.data(0, Qt.ItemDataRole.UserRole)["mtime"]
         target = min(children, key=key) if keep_oldest else max(children, key=key)
+        # 擋掉 itemChanged 洪水:一次改多個勾選只在最後檢查一次防呆(見 dupe_page 同處說明)。
+        self._tree.blockSignals(True)
         for c in children:
             c.setCheckState(0, Qt.CheckState.Unchecked if c is target else Qt.CheckState.Checked)
+        self._tree.blockSignals(False)
+        self._check_guard()
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         self._check_guard()
@@ -441,15 +454,12 @@ class SimilarityPage(QWidget):
         path = data["path"]
         ext = os.path.splitext(path)[1].lower()
         if ext in analysis.IMAGE_EXTS:
-            pix = QPixmap(path)
-            if pix.isNull():
+            pix = load_thumbnail(path, 320)
+            if pix is None:
                 self._preview_image.setPixmap(QPixmap())
                 self._preview_image.setText("無法預覽")
             else:
-                scaled = pix.scaled(
-                    320, 320, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-                )
-                self._preview_image.setPixmap(scaled)
+                self._preview_image.setPixmap(pix)
                 self._preview_image.setText("")
         else:
             self._preview_image.setPixmap(QPixmap())

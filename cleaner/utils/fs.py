@@ -54,13 +54,13 @@ def wrap_path_for_label(path: str) -> str:
 
 
 def format_size(n: int) -> str:
-    """以 1024 為底,輸出 B / KB / MB / GB,保留兩位小數。"""
+    """以 1024 為底,輸出 B / KB / MB / GB / TB,保留兩位小數。"""
     size = float(n)
-    for unit in ("B", "KB", "MB"):
+    for unit in ("B", "KB", "MB", "GB"):
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
-    return f"{size:.2f} GB"
+    return f"{size:.2f} TB"
 
 
 def long_path(p: str) -> str:
@@ -76,13 +76,47 @@ def is_reparse_point(entry: os.DirEntry) -> bool:
         return True   # 讀不到就當作危險,跳過
 
 
+def split_excludes(exclude_dirs: list[str] | None) -> tuple[list[str], set[str]]:
+    """把排除清單拆成 (路徑前綴清單, 純目錄名集合),皆正規化(normcase)。
+
+    含路徑分隔符的項目(如 ``C:\\Windows\\WinSxS``)當「路徑前綴」比對;不含分隔符的
+    項目(如 ``$Recycle.Bin``、``System Volume Information``)當「目錄名」比對。這樣避免
+    了舊版無錨點子字串比對的過度命中——例如使用者自建的 ``D:\\System Volume Information 備份``
+    以前會被整個跳過,現在只有目錄名剛好等於排除名的才算。
+    """
+    prefixes: list[str] = []
+    names: set[str] = set()
+    for d in exclude_dirs or []:
+        nd = os.path.normcase(d)
+        if os.sep in nd or (os.altsep and os.altsep in nd):
+            prefixes.append(nd.rstrip(os.sep + (os.altsep or "")))
+        else:
+            names.add(nd)
+    return prefixes, names
+
+
+def is_excluded_dir(entry_path: str, entry_name: str, prefixes: list[str], names: set[str]) -> bool:
+    """給定目錄的完整路徑與 basename(呼叫端負責正規化前先傳原始值),判斷是否命中排除。
+    目錄名精確比對 names;完整路徑對每個 prefix 做「相等或以 prefix + 分隔符為開頭」比對。
+    """
+    if os.path.normcase(entry_name) in names:
+        return True
+    if prefixes:
+        norm = os.path.normcase(entry_path)
+        for p in prefixes:
+            if norm == p or norm.startswith(p + os.sep):
+                return True
+    return False
+
+
 def safe_walk(root: str, on_error=None, exclude_dirs: list[str] | None = None):
     """唯一允許的遍歷器:不進入 reparse point,權限錯誤跳過。
 
-    exclude_dirs:選填,子字串比對(不分大小寫)命中即不下探該目錄,
+    exclude_dirs:選填,命中即不下探該目錄(見 split_excludes 的分段比對規則),
     供分析功能排除 WinSxS、$Recycle.Bin 等雜訊目錄用(見 DEVDOC §8.1)。
     """
-    exclude_lower = [os.path.normcase(d) for d in (exclude_dirs or [])]
+    prefixes, names = split_excludes(exclude_dirs)
+    have_exclude = bool(prefixes or names)
     stack = [root]
     while stack:
         d = stack.pop()
@@ -93,10 +127,8 @@ def safe_walk(root: str, on_error=None, exclude_dirs: list[str] | None = None):
                         if entry.is_dir(follow_symlinks=False):
                             if is_reparse_point(entry):
                                 continue
-                            if exclude_lower:
-                                norm = os.path.normcase(entry.path)
-                                if any(ex in norm for ex in exclude_lower):
-                                    continue
+                            if have_exclude and is_excluded_dir(entry.path, entry.name, prefixes, names):
+                                continue
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             yield entry

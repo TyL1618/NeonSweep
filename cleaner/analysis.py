@@ -11,7 +11,7 @@ import re
 import time
 import winreg
 
-from .utils.fs import is_reparse_point, long_path, safe_walk
+from .utils.fs import is_excluded_dir, is_reparse_point, long_path, safe_walk, split_excludes
 
 EXCLUDED_DIRS = [
     r"C:\Windows\WinSxS",
@@ -247,8 +247,13 @@ def find_duplicates(
     def cancelled() -> bool:
         return bool(cancel_check and cancel_check())
 
-    # 階段 1:依大小分組
-    size_groups: dict[int, list[str]] = {}
+    # 階段 1:依大小分組。
+    # 記憶體:整碟掃描時絕大多數大小是唯一的(單例),用「先存單一字串、第二次撞到同大小才升級成
+    # list」避免每個單例都揹一個 list 物件——百萬檔等級可省下可觀記憶體。
+    # (硬連結去重刻意不在這裡做:os.scandir 的 DirEntry.stat 在 Windows 上 st_nlink/st_ino 都是 0
+    #  〔用的是廉價的目錄掃描資料〕,拿不到硬連結資訊;要真的 stat 每個檔案太貴。改在最後成組時對
+    #  已確定 byte 相同的少數候選才做 os.stat 去重,見函式結尾。)
+    size_map: dict[int, "str | list[str]"] = {}
     scanned = 0
     last_emit = 0.0
     for drive in drives:
@@ -269,9 +274,15 @@ def find_duplicates(
                 last_emit = now
                 if progress_cb:
                     progress_cb(1, scanned, 0, entry.path)
-            size_groups.setdefault(st.st_size, []).append(entry.path)
+            existing = size_map.get(st.st_size)
+            if existing is None:
+                size_map[st.st_size] = entry.path
+            elif type(existing) is list:
+                existing.append(entry.path)
+            else:
+                size_map[st.st_size] = [existing, entry.path]
 
-    candidates = [paths for paths in size_groups.values() if len(paths) >= 2]
+    candidates = [paths for paths in size_map.values() if type(paths) is list]
 
     # 階段 2:前 4KB 快速雜湊
     quick_groups: dict[tuple[int, bytes], list[str]] = {}
@@ -318,6 +329,10 @@ def find_duplicates(
             try:
                 with open(long_path(path), "rb") as f:
                     while True:
+                        # 大檔(數十 GB 的映像檔)雜湊要好幾分鐘,cancel 不能只在檔案之間檢查,
+                        # 否則按了取消要等整個檔案雜湊完。每讀一塊(1MB)就檢查一次,成本可忽略。
+                        if cancelled():
+                            return []
                         block = f.read(1024 * 1024)
                         if not block:
                             break
@@ -326,7 +341,30 @@ def find_duplicates(
                 continue
             full_groups.setdefault(hasher.hexdigest(), []).append(path)
 
-    return [paths for paths in full_groups.values() if len(paths) >= 2]
+    # 硬連結去重(在此才做,候選已很少):同組內指向同一份實體資料(dev, ino)的多個路徑只留一個
+    # 代表。pnpm 全域 store、部分系統檔會讓同一份資料出現在多個路徑,它們必然 byte 相同而落在同組,
+    # 但刪任一個都不會釋放空間(「可省 X GB」會造假),還會白白重複讀取。此時每組才有 os.stat 的
+    # 成本(遠少於全碟每檔 stat)。st_ino 為 0(取不到,如某些非 NTFS 卷)的檔案不去重、照常保留。
+    result: list[list[str]] = []
+    for paths in full_groups.values():
+        if len(paths) < 2:
+            continue
+        seen_ids: set[tuple[int, int]] = set()
+        deduped: list[str] = []
+        for path in paths:
+            try:
+                st = os.stat(path)
+                key = (st.st_dev, st.st_ino) if st.st_ino else None
+            except OSError:
+                key = None
+            if key is not None:
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+            deduped.append(path)
+        if len(deduped) >= 2:
+            result.append(deduped)
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -367,6 +405,7 @@ def find_devspaces(drives: list[str], progress_cb=None, cancel_check=None) -> li
     找到即停止深入該目錄,但另外計算其總大小。
     """
     results: list[dict] = []
+    ex_prefixes, ex_names = split_excludes(EXCLUDED_DIRS)
 
     def cancelled() -> bool:
         return bool(cancel_check and cancel_check())
@@ -394,16 +433,23 @@ def find_devspaces(drives: list[str], progress_cb=None, cancel_check=None) -> li
                 except OSError:
                     continue
 
-                norm_path = os.path.normcase(entry.path)
-                if any(os.path.normcase(ex) in norm_path for ex in EXCLUDED_DIRS):
+                if is_excluded_dir(entry.path, entry.name, ex_prefixes, ex_names):
                     continue
 
                 name = entry.name
-                is_target = name == "target" and os.path.isfile(
-                    os.path.join(os.path.dirname(entry.path), "Cargo.toml")
-                )
+                lname = name.lower()
+                if lname in ("venv", ".venv"):
+                    # venv/.venv 是很常見的資料夾名,可能被使用者拿去命名不相干的資料夾;要求裡面
+                    # 有 pyvenv.cfg(標準 venv 一定有)才算,避免把同名的一般資料夾誤列。
+                    is_devspace = os.path.isfile(os.path.join(entry.path, "pyvenv.cfg"))
+                elif lname in DEVSPACE_DIR_NAMES:
+                    is_devspace = True
+                elif name == "target":
+                    is_devspace = os.path.isfile(os.path.join(os.path.dirname(entry.path), "Cargo.toml"))
+                else:
+                    is_devspace = False
 
-                if name.lower() in DEVSPACE_DIR_NAMES or is_target:
+                if is_devspace:
                     size = _dir_size(entry.path, cancel_check)
                     project_root = os.path.dirname(entry.path)
                     last_activity = _first_level_max_mtime(project_root, entry.path)

@@ -30,8 +30,16 @@ cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
 # 影片取樣參數
 VIDEO_INTERVAL_SEC = 1.0     # 每幾秒取一幀
 VIDEO_MAX_SAMPLES = 300      # 單片最多取樣幀數(上限,避免超長片把 DP 撐爆)
+VIDEO_REFINE_MAX_SAMPLES = 600  # 精修階段單邊取樣上限:候選窗可能很長(兩部都是長片、offset≈0
+                                # 時窗長≈整片),必須跟粗篩一樣有上限,否則解碼次數與 Smith-Waterman
+                                # 的 O(na*nb) DP 會隨窗長無上限膨脹(見 _refine_match)
 VIDEO_FRAME_THRESHOLD = 10   # 兩幀 dHash 視為「相同畫面」的 Hamming 上限
 VIDEO_FINGERPRINT_WORKERS = 4  # 平行算指紋的執行緒數,偏保守——傳統硬碟上開太多平行 seek 反而互相拖累
+
+# 圖片退化指紋門檻:純色圖 dHash 全為 0、平滑漸層圖可能全為 1,這類圖的 dHash 幾乎沒有鑑別力
+# (純黑圖彼此距離恆為 0),會製造大量假群組。popcount(1 的個數)落在 [DEGENERATE, 64-DEGENERATE]
+# 之外的視為退化指紋,不納入分群。門檻取得很保守,只濾掉近乎純色 / 近乎完美漸層。
+IMAGE_DEGENERATE_POPCOUNT = 3
 
 # 浮水印寬容度:算指紋前先裁掉四邊各這個比例,避開角落/邊緣常見的浮水印位置。
 # 只用在「影片」取樣路徑(_sample_window/build_video_print),刻意不動 image_dhash(圖片路徑)。
@@ -69,12 +77,20 @@ def _dhash_from_gray(gray, crop_margin: float = 0.0) -> int:
 def image_dhash(path: str) -> int | None:
     """讀圖算 dHash。用 imdecode(np.fromfile) 而非 cv2.imread,避開後者對 Windows 非 ASCII
     路徑讀取失敗的問題。讀不到 / 非影像回傳 None。
+
+    效能:先用 IMREAD_REDUCED_GRAYSCALE_8 以 1/8 尺寸解碼(JPEG 直接在 DCT 域縮小,大圖可快
+    數倍),反正終點是 9x8 dHash,先縮到 1/8 再 resize 精度幾乎無損。縮完任一邊 < 9 時(小圖、
+    或不支援縮小解碼的格式回傳過小影像)退回全解析度重解一次。注意:縮小解碼與全解析度解碼的
+    dHash 不保證逐 bit 相同(INTER_AREA 平均的來源像素不同),但差異僅一兩個 bit,遠在相似門檻
+    (6~14 bit)之內——這是速度與精度的取捨,不像 popcount 那次是完全等價的無損替換。
     """
     try:
         data = np.fromfile(path, dtype=np.uint8)
         if data.size == 0:
             return None
-        img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+        img = cv2.imdecode(data, cv2.IMREAD_REDUCED_GRAYSCALE_8)
+        if img is None or img.shape[0] < 9 or img.shape[1] < 9:
+            img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return None
         return _dhash_from_gray(img)
@@ -111,9 +127,17 @@ def _open_capture(path: str):
     return None
 
 
-def _sample_window(path: str, start_sec: float, end_sec: float, interval_sec: float, max_samples: int | None = None):
+def _sample_window(
+    path: str,
+    start_sec: float,
+    end_sec: float,
+    interval_sec: float,
+    max_samples: int | None = None,
+    cancel_check=None,
+):
     """對 [start_sec, end_sec) 這段時間窗,按 interval_sec 取樣算 dHash,回傳 list[int]。
     供粗篩(全片,start=0/end=duration)與精修(候選片段附近的小窗)共用。
+    cancel_check:精修可能對長片密集取樣、耗時較久,每個樣本都檢查一次取消旗標。
     """
     cap = _open_capture(path)
     if cap is None:
@@ -122,6 +146,8 @@ def _sample_window(path: str, start_sec: float, end_sec: float, interval_sec: fl
         hashes = []
         t = max(0.0, start_sec)
         while t < end_sec and (max_samples is None or len(hashes) < max_samples):
+            if cancel_check and cancel_check():
+                break
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
             ok, frame = cap.read()
             if not ok:
@@ -201,10 +227,6 @@ def _estimate_offset(va: dict, vb: dict, frame_threshold: int):
 # ----------------------------------------------------------------------
 
 
-def hamming(a: int, b: int) -> int:
-    return bin(a ^ b).count("1")
-
-
 if hasattr(np, "bitwise_count"):
 
     def _popcount_u64(arr: np.ndarray) -> np.ndarray:
@@ -257,6 +279,10 @@ def find_similar_images(targets, threshold=10, progress_cb=None, cancel_check=No
                 last_emit = now
                 progress_cb(1, scanned, 0, entry.path)
             if h is not None:
+                pc = h.bit_count()
+                if pc < IMAGE_DEGENERATE_POPCOUNT or pc > 64 - IMAGE_DEGENERATE_POPCOUNT:
+                    # 退化指紋(近純色 / 近完美漸層):鑑別力太低,納入只會製造假群組,略過。
+                    continue
                 paths.append(entry.path)
                 hashes.append(h)
 
@@ -264,35 +290,52 @@ def find_similar_images(targets, threshold=10, progress_cb=None, cancel_check=No
     if n < 2:
         return []
 
-    # 階段 2:錨點分群(向量化 popcount)。
-    arr = np.array(hashes, dtype=np.uint64)
-    assigned = np.zeros(n, dtype=bool)
-    groups: list[list[int]] = []
+    # 階段 2 前置:先把「完全相同的 dHash」收成同一桶,只對「相異指紋的代表」跑 O(m²) 錨點分群。
+    # 完全重複的圖(同圖重存、重複下載)很常見,先摺疊可大幅縮小 m;桶內成員彼此距離必為 0,
+    # 最後直接展開回原始索引。距離保證不變(代表跟錨點 <= threshold、桶內成員跟代表 = 0,故同組
+    # 任兩張 <= threshold×2)。
+    buckets: dict[int, list[int]] = {}
+    for idx, h in enumerate(hashes):
+        buckets.setdefault(h, []).append(idx)
+
+    uniq = list(buckets.keys())
+    m = len(uniq)
+    arr = np.array(uniq, dtype=np.uint64)
+    assigned = np.zeros(m, dtype=bool)
+    uniq_groups: list[list[int]] = []   # 每組:uniq 的索引清單
     last_emit = 0.0
-    for i in range(n):
+    for i in range(m):
         if cancelled():
             return []
         now = time.monotonic()
         if progress_cb and (i % 10 == 0 or (now - last_emit) >= PROGRESS_TIME_INTERVAL):
             last_emit = now
-            progress_cb(2, i, n, paths[i])
+            progress_cb(2, i, m, paths[buckets[uniq[i]][0]])
         if assigned[i]:
             continue
         assigned[i] = True
-        if i + 1 >= n:
-            continue
-        later_mask = np.zeros(n, dtype=bool)
-        later_mask[i + 1 :] = ~assigned[i + 1 :]
-        later_idx = np.nonzero(later_mask)[0]
-        if later_idx.size == 0:
-            continue
-        dists = _popcount_u64(arr[later_idx] ^ arr[i])
-        matched = later_idx[dists <= threshold]
-        if matched.size:
-            assigned[matched] = True
-            groups.append([i] + matched.tolist())
+        members = [i]
+        if i + 1 < m:
+            later_mask = np.zeros(m, dtype=bool)
+            later_mask[i + 1 :] = ~assigned[i + 1 :]
+            later_idx = np.nonzero(later_mask)[0]
+            if later_idx.size:
+                dists = _popcount_u64(arr[later_idx] ^ arr[i])
+                matched = later_idx[dists <= threshold]
+                if matched.size:
+                    assigned[matched] = True
+                    members.extend(matched.tolist())
+        uniq_groups.append(members)
 
-    return [[paths[idx] for idx in g] for g in groups if len(g) >= 2]
+    # 展開回原始路徑索引:一組的成員 = 該組每個 uniq 指紋各自桶內的所有原始索引。
+    result: list[list[str]] = []
+    for members in uniq_groups:
+        orig: list[int] = []
+        for u in members:
+            orig.extend(buckets[uniq[u]])
+        if len(orig) >= 2:
+            result.append([paths[k] for k in orig])
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -308,10 +351,12 @@ def _match_matrix(a: np.ndarray, b: np.ndarray, frame_threshold: int) -> np.ndar
 
 def _local_align(match_rows, na: int, nb: int):
     """對布林 match 矩陣(list[list[bool]])跑 Smith-Waterman 區域比對。
-    回傳 (best_score, a_start, a_end, b_start, b_end)(索引皆 0-based、含端點)。
+    回傳 (best_score, a_start, a_end, b_start, b_end, match_count)(索引皆 0-based、含端點)。
+
+    match_count 是最佳區段回溯路徑上「真正對到的幀數」(對角線且該格為 match 的步數),
+    用來計算實際相似秒數:對齊出來的區段裡可能夾雜 mismatch/gap,用區段跨度當相似時間會高估,
+    改用真正對到的幀數才能過濾「跨度長但實際很多錯配」的巧合匹配。
     """
-    prev = [0] * (nb + 1)
-    # 只保留回溯所需的方向矩陣,H 用滾動列(省記憶體)
     H = [[0] * (nb + 1) for _ in range(na + 1)]
     best = 0
     bi = bj = 0
@@ -336,20 +381,24 @@ def _local_align(match_rows, na: int, nb: int):
                 bi = i
                 bj = j
     if best <= 0:
-        return 0, 0, 0, 0, 0
-    # 回溯到 0
+        return 0, 0, 0, 0, 0, 0
+    # 回溯到 0,順便數對角線 match 步數
     i, j = bi, bj
+    match_count = 0
     while i > 0 and j > 0 and H[i][j] > 0:
         cur = H[i][j]
-        s = _SW_MATCH if match_rows[i - 1][j - 1] else _SW_MISMATCH
+        is_match = match_rows[i - 1][j - 1]
+        s = _SW_MATCH if is_match else _SW_MISMATCH
         if cur == H[i - 1][j - 1] + s:
+            if is_match:
+                match_count += 1
             i -= 1
             j -= 1
         elif cur == H[i - 1][j] + _SW_GAP:
             i -= 1
         else:
             j -= 1
-    return best, i, bi - 1, j, bj - 1
+    return best, i, bi - 1, j, bj - 1, match_count
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -368,31 +417,41 @@ def _refine_match(
     tb1: float,
     frame_threshold: int,
     base_interval: float = VIDEO_INTERVAL_SEC,
+    cancel_check=None,
 ):
     """精修階段:粗篩只給了「大概哪一段對得上」的候選時間窗(可能因為粗篩間隔較粗而不準)。
-    這裡只針對候選窗附近(留一點 margin 免得邊界剛好切到)重新用 base_interval 密集取樣,
-    重新跑一次(範圍很小、成本低的)Smith-Waterman,拿到精確到秒的邊界,同時二次驗證排除
-    粗篩階段的巧合匹配。回傳 (a_start,a_end,b_start,b_end,matched_seconds) 或 None(驗證失敗)。
+    這裡只針對候選窗附近(留一點 margin 免得邊界剛好切到)重新密集取樣,重新跑一次
+    Smith-Waterman,拿到精確到秒的邊界,同時二次驗證排除粗篩階段的巧合匹配。
+    回傳 (a_start,a_end,b_start,b_end,matched_seconds) 或 None(驗證失敗)。
+
+    重要:候選窗長度沒有先天上限——兩部都是長片、offset≈0 時,窗長會逼近整片長度。若仍固定用
+    base_interval 密集取樣,解碼次數(每秒一次 seek)與 _local_align 的 O(na*nb) DP 都會隨窗長
+    無上限爆掉(兩部 60 分鐘影片 = 3600×3600 純 Python DP + 數千次 seek)。因此取樣間隔依窗長
+    自動放寬,確保兩邊各自的取樣數都 <= VIDEO_REFINE_MAX_SAMPLES;窗短時仍維持 base_interval 的
+    秒級精度,長窗則退到幾秒精度(對「顯示相似區間給人看」完全夠用)。
     """
     margin = base_interval * 4
     a_start, a_end = max(0.0, ta0 - margin), ta1 + margin
     b_start, b_end = max(0.0, tb0 - margin), tb1 + margin
 
-    hash_a = _sample_window(path_a, a_start, a_end, base_interval)
-    hash_b = _sample_window(path_b, b_start, b_end, base_interval)
+    span = max(a_end - a_start, b_end - b_start)
+    interval = max(base_interval, span / VIDEO_REFINE_MAX_SAMPLES)
+
+    hash_a = _sample_window(path_a, a_start, a_end, interval, VIDEO_REFINE_MAX_SAMPLES, cancel_check)
+    hash_b = _sample_window(path_b, b_start, b_end, interval, VIDEO_REFINE_MAX_SAMPLES, cancel_check)
     if len(hash_a) < 2 or len(hash_b) < 2:
         return None
 
     match = _match_matrix(np.array(hash_a, dtype=np.uint64), np.array(hash_b, dtype=np.uint64), frame_threshold)
-    best, a0, a1, b0, b1 = _local_align(match.tolist(), len(hash_a), len(hash_b))
+    best, a0, a1, b0, b1, match_count = _local_align(match.tolist(), len(hash_a), len(hash_b))
     if best <= 0:
         return None
-    matched_sec = min(a1 - a0 + 1, b1 - b0 + 1) * base_interval
+    matched_sec = match_count * interval
     return (
-        a_start + a0 * base_interval,
-        a_start + (a1 + 1) * base_interval,
-        b_start + b0 * base_interval,
-        b_start + (b1 + 1) * base_interval,
+        a_start + a0 * interval,
+        a_start + (a1 + 1) * interval,
+        b_start + b0 * interval,
+        b_start + (b1 + 1) * interval,
         matched_sec,
     )
 
@@ -487,6 +546,10 @@ def find_similar_videos(
         for j in range(i + 1, n):
             if assigned[j]:
                 continue
+            if cancelled():
+                # 內層每對都檢查:一對比對可能觸發精修(解碼兩段影片,分鐘等級),不能只在
+                # 錨點 i 的開頭檢查,否則按了取消還要等整輪候選跑完。
+                return []
             done_pairs += 1
             if progress_cb:
                 now = time.monotonic()
@@ -502,10 +565,12 @@ def find_similar_videos(
                 match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold)
                 if not match.any():
                     continue
-                best, a0, a1, b0, b1 = _local_align(match.tolist(), len(va["hashes"]), len(vb["hashes"]))
+                best, a0, a1, b0, b1, match_count = _local_align(
+                    match.tolist(), len(va["hashes"]), len(vb["hashes"])
+                )
                 if best <= 0:
                     continue
-                matched_sec = min(a1 - a0 + 1, b1 - b0 + 1) * base_interval
+                matched_sec = match_count * base_interval
                 if matched_sec < min_match_seconds:
                     continue
                 fa0, fa1 = a0 * base_interval, (a1 + 1) * base_interval
@@ -521,7 +586,9 @@ def find_similar_videos(
                 if ta1 - ta0 < min_match_seconds:
                     continue
                 tb0, tb1 = ta0 - offset, ta1 - offset
-                refined = _refine_match(va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval)
+                refined = _refine_match(
+                    va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval, cancel_check
+                )
                 if refined is None:
                     continue
                 fa0, fa1, fb0, fb1, matched_sec = refined
