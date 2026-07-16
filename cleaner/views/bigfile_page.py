@@ -5,10 +5,13 @@ from PyQt6.QtCore import QThread, Qt
 from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -89,6 +92,30 @@ class BigFilePage(QWidget):
         )
         layout.addWidget(self._drive_chips)
 
+        folder_hint = QLabel("指定資料夾範圍(可選):新增後會改成只掃描這些資料夾(含子目錄),不新增則掃描上方勾選的磁碟")
+        folder_hint.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        folder_hint.setWordWrap(True)
+        layout.addWidget(folder_hint)
+
+        folder_btn_row = QHBoxLayout()
+        add_folder_btn = QPushButton("+ 新增資料夾")
+        add_folder_btn.clicked.connect(self._add_folder)
+        remove_folder_btn = QPushButton("移除選取")
+        remove_folder_btn.clicked.connect(self._remove_selected_folder)
+        folder_btn_row.addWidget(add_folder_btn)
+        folder_btn_row.addWidget(remove_folder_btn)
+        folder_btn_row.addStretch(1)
+        layout.addLayout(folder_btn_row)
+
+        self._folder_list = QListWidget()
+        self._folder_list.setMaximumHeight(90)
+        self._folder_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._folder_list.setStyleSheet(
+            f"background-color: {theme.BG_PANEL}; color: {theme.TEXT_MAIN}; "
+            f"font-family: Consolas; font-size: 9pt; border: 1px solid {theme.TEXT_DIM};"
+        )
+        layout.addWidget(self._folder_list)
+
         layout.addStretch(1)
 
         start_btn = QPushButton("開始掃描")
@@ -141,9 +168,29 @@ class BigFilePage(QWidget):
 
         return page
 
+    def _add_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if folder in self._selected_folders():
+            return
+        item = QListWidgetItem(display_path(folder))
+        item.setData(Qt.ItemDataRole.UserRole, folder)
+        item.setToolTip(folder)
+        self._folder_list.addItem(item)
+
+    def _remove_selected_folder(self) -> None:
+        for item in self._folder_list.selectedItems():
+            self._folder_list.takeItem(self._folder_list.row(item))
+
+    def _selected_folders(self) -> list[str]:
+        return [self._folder_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self._folder_list.count())]
+
     def _start_scan(self) -> None:
-        drives = self._drive_chips.checked_keys()
-        if not drives:
+        folders = self._selected_folders()
+        targets = folders if folders else self._drive_chips.checked_keys()
+        if not targets:
             return
 
         self._scan_count_label.setText("已掃描 0 個檔案")
@@ -151,7 +198,7 @@ class BigFilePage(QWidget):
         self._stack.setCurrentWidget(self._scanning_page)
 
         self._thread = QThread(self)
-        self._worker = BigFileWorker(drives)
+        self._worker = BigFileWorker(targets)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._thread.quit)
@@ -159,7 +206,10 @@ class BigFilePage(QWidget):
         self._thread.finished.connect(self._thread.deleteLater)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_scan_finished)
-        self._scanned_drives = list(drives)
+        # atime 可靠性是「每顆磁碟」的登錄檔設定,不是每個掃描根目錄的設定;
+        # 就算掃描範圍縮小成子資料夾,也要還原成磁碟代號本身,
+        # 不然 _on_scan_finished 裡用檔案路徑前 3 碼查表會完全對不上,永遠落回預設值 True。
+        self._scanned_drives = list({t[:1].upper() + ":\\" for t in targets if t})
         self._thread.start()
 
     def _cancel_scan(self) -> None:

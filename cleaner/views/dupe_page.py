@@ -5,10 +5,13 @@ from PyQt6.QtCore import QThread, Qt
 from PyQt6.QtGui import QFontMetrics, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -82,6 +85,30 @@ class DupePage(QWidget):
         self._drive_chips = ChipRow(items=[(d, d.rstrip("\\")) for d in drives], default_checked={sysdrive})
         layout.addWidget(self._drive_chips)
 
+        folder_hint = QLabel("指定資料夾範圍(可選):新增後會改成只掃描這些資料夾(含子目錄),不新增則掃描上方勾選的磁碟")
+        folder_hint.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        folder_hint.setWordWrap(True)
+        layout.addWidget(folder_hint)
+
+        folder_btn_row = QHBoxLayout()
+        add_folder_btn = QPushButton("+ 新增資料夾")
+        add_folder_btn.clicked.connect(self._add_folder)
+        remove_folder_btn = QPushButton("移除選取")
+        remove_folder_btn.clicked.connect(self._remove_selected_folder)
+        folder_btn_row.addWidget(add_folder_btn)
+        folder_btn_row.addWidget(remove_folder_btn)
+        folder_btn_row.addStretch(1)
+        layout.addLayout(folder_btn_row)
+
+        self._folder_list = QListWidget()
+        self._folder_list.setMaximumHeight(90)
+        self._folder_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._folder_list.setStyleSheet(
+            f"background-color: {theme.BG_PANEL}; color: {theme.TEXT_MAIN}; "
+            f"font-family: Consolas; font-size: 9pt; border: 1px solid {theme.TEXT_DIM};"
+        )
+        layout.addWidget(self._folder_list)
+
         self._type_chips = ChipRow(items=TYPE_FILTERS, default_checked={"all"})
         layout.addWidget(self._type_chips)
 
@@ -148,6 +175,25 @@ class DupePage(QWidget):
 
         return page
 
+    def _add_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if folder in self._selected_folders():
+            return
+        item = QListWidgetItem(display_path(folder))
+        item.setData(Qt.ItemDataRole.UserRole, folder)
+        item.setToolTip(folder)
+        self._folder_list.addItem(item)
+
+    def _remove_selected_folder(self) -> None:
+        for item in self._folder_list.selectedItems():
+            self._folder_list.takeItem(self._folder_list.row(item))
+
+    def _selected_folders(self) -> list[str]:
+        return [self._folder_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self._folder_list.count())]
+
     def _selected_extensions(self) -> set | None:
         keys = self._type_chips.checked_keys()
         if not keys or "all" in keys:
@@ -159,8 +205,9 @@ class DupePage(QWidget):
         return exts or None
 
     def _start_scan(self) -> None:
-        drives = self._drive_chips.checked_keys()
-        if not drives:
+        folders = self._selected_folders()
+        targets = folders if folders else self._drive_chips.checked_keys()
+        if not targets:
             return
         extensions = self._selected_extensions()
         min_size = MIN_SIZE_OPTIONS[self._min_size_combo.currentIndex()][1]
@@ -171,7 +218,7 @@ class DupePage(QWidget):
         self._stack.setCurrentWidget(self._scanning_page)
 
         self._thread = QThread(self)
-        self._worker = DupeWorker(drives, extensions, min_size)
+        self._worker = DupeWorker(targets, extensions, min_size)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._thread.quit)
