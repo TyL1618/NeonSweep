@@ -210,8 +210,8 @@ class SimilarityWorker(QObject):
         super().__init__()
         self._targets = targets
         self._mode = mode                                 # "image" | "video"
-        self._threshold = threshold                       # 圖片 Hamming 門檻
-        self._min_match_seconds = min_match_seconds       # 影片最短相似片段(秒)
+        self._threshold = threshold                       # Hamming 門檻:圖片是兩張圖整體比對,影片是逐幀比對
+        self._min_match_seconds = min_match_seconds       # 影片專用:最短相似片段(秒)
         self._cancelled = False
 
     def cancel(self):
@@ -233,7 +233,11 @@ class SimilarityWorker(QObject):
         cancel = lambda: self._cancelled
         if self._mode == "video":
             raw = similarity.find_similar_videos(
-                self._targets, min_match_seconds=self._min_match_seconds, progress_cb=emit, cancel_check=cancel
+                self._targets,
+                min_match_seconds=self._min_match_seconds,
+                frame_threshold=self._threshold,
+                progress_cb=emit,
+                cancel_check=cancel,
             )
             result = [{"paths": d["paths"], "segments": d["segments"], "kind": "video"} for d in raw]
         else:

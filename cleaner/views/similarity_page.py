@@ -32,12 +32,32 @@ from .common import HUGE_FILE_THRESHOLD, ChipRow, FolderPicker, confirm_delete, 
 
 PATH_ELIDE_WIDTH = 480
 TYPE_FILTERS = [("image", "圖片"), ("video", "影片")]
-# (標籤, 圖片 Hamming 門檻, 影片最短相似片段秒數)
-STRICTNESS_OPTIONS = [
-    ("寬鬆(找比較多,誤判也較多)", 14, 12),
-    ("標準", 10, 20),
-    ("嚴格(只找非常像的)", 6, 30),
+
+# 圖片:(標籤, Hamming 門檻)——兩張圖的 64-bit dHash 指紋逐 bit 比對,不同的 bit 數 <= 門檻才算相似。
+IMAGE_STRICTNESS_OPTIONS = [
+    ("寬鬆", 14),
+    ("標準", 10),
+    ("嚴格", 6),
 ]
+
+# 影片:(標籤, 每幀 Hamming 門檻, 最短連續相似秒數)。每幀門檻決定「這一幀算不算同一畫面」,
+# 最短秒數決定「連續相似要多久才不算巧合」(過濾共用片頭/黑畫面之類的雜訊)。
+# 標準檔位的數值維持跟改版前一致,行為不變。「非常寬鬆」只把秒數壓到 4,每幀門檻沿用「寬鬆」
+# 的 14,不跟著再放寬——兩個維度同時最鬆會讓巧合誤判疊加,秒數已經很短了沒必要雙重放寬。
+VIDEO_STRICTNESS_OPTIONS = [
+    ("非常寬鬆", 14, 4),
+    ("寬鬆", 14, 12),
+    ("標準", 10, 20),
+    ("嚴格", 6, 30),
+]
+
+
+def _image_strictness_label(name: str, threshold: int) -> str:
+    return f"{name}(64 bit 指紋最多容許 {threshold} bit 不同)"
+
+
+def _video_strictness_label(name: str, frame_threshold: int, min_match_seconds: int) -> str:
+    return f"{name}(每幀最多容許 {frame_threshold} bit 不同,至少連續重疊 {min_match_seconds} 秒)"
 
 
 class SimilarityPage(QWidget):
@@ -80,17 +100,26 @@ class SimilarityPage(QWidget):
         layout.addWidget(hint)
 
         self._type_chips = ChipRow(items=TYPE_FILTERS, default_checked={"image"}, exclusive=True)
+        self._type_chips.selection_changed.connect(self._on_type_changed)
         layout.addWidget(self._type_chips)
 
         strict_row = QHBoxLayout()
         strict_label = QLabel("相似程度:")
         strict_label.setStyleSheet(f"color: {theme.TEXT_DIM};")
-        self._strict_combo = QComboBox()
-        for label, _t, _m in STRICTNESS_OPTIONS:
-            self._strict_combo.addItem(label)
-        self._strict_combo.setCurrentIndex(1)  # 標準
         strict_row.addWidget(strict_label)
-        strict_row.addWidget(self._strict_combo)
+
+        self._image_strict_combo = QComboBox()
+        for name, threshold in IMAGE_STRICTNESS_OPTIONS:
+            self._image_strict_combo.addItem(_image_strictness_label(name, threshold))
+        self._image_strict_combo.setCurrentIndex(1)  # 標準
+        strict_row.addWidget(self._image_strict_combo)
+
+        self._video_strict_combo = QComboBox()
+        for name, frame_threshold, min_match_seconds in VIDEO_STRICTNESS_OPTIONS:
+            self._video_strict_combo.addItem(_video_strictness_label(name, frame_threshold, min_match_seconds))
+        self._video_strict_combo.setCurrentIndex(2)  # 標準
+        strict_row.addWidget(self._video_strict_combo)
+
         strict_row.addStretch(1)
         layout.addLayout(strict_row)
 
@@ -119,7 +148,18 @@ class SimilarityPage(QWidget):
         row.addStretch(1)
         layout.addLayout(row)
         layout.addStretch(2)
+
+        self._on_type_changed()  # 依預設勾選的類型,只顯示對應的相似程度下拉
         return page
+
+    def _on_type_changed(self) -> None:
+        mode = self._current_mode()
+        self._image_strict_combo.setVisible(mode == "image")
+        self._video_strict_combo.setVisible(mode == "video")
+
+    def _current_mode(self) -> str:
+        keys = self._type_chips.checked_keys()
+        return keys[0] if keys else "image"
 
     # -------------------------------------------------------------- SCANNING
     def _build_scanning_page(self) -> QWidget:
@@ -222,9 +262,12 @@ class SimilarityPage(QWidget):
         targets = folders if folders else self._drive_chips.checked_keys()
         if not targets:
             return
-        keys = self._type_chips.checked_keys()
-        mode = keys[0] if keys else "image"
-        _label, threshold, min_match_seconds = STRICTNESS_OPTIONS[self._strict_combo.currentIndex()]
+        mode = self._current_mode()
+        if mode == "video":
+            _name, threshold, min_match_seconds = VIDEO_STRICTNESS_OPTIONS[self._video_strict_combo.currentIndex()]
+        else:
+            _name, threshold = IMAGE_STRICTNESS_OPTIONS[self._image_strict_combo.currentIndex()]
+            min_match_seconds = 20  # 圖片模式用不到,給個值即可
 
         self._phase_label.setText("正在計算指紋…")
         self._progress_bar.set_indeterminate(True)
