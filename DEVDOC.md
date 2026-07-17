@@ -921,11 +921,30 @@ third_party/smartmontools/
   併入 §8.6「評估過、量測後決定不做的項目」——真實規模(1500 部、112 萬對)下批次版
   514 秒比原版 162 秒慢 3.2 倍(成本大頭是陣列運算本身,不是呼叫開銷),已完整 revert。
 
-- [ ] **配對結論快取**:`print_cache.py` 新增一張表,key = `(內容key_A, 內容key_B,
-  frame_threshold, min_match_seconds, FP_VERSION)` 排序後組合,value = 不相似 / 相似+
-  片段區間。庫沒變、參數沒變時,重掃可以跳過整個階段 2(目前每次重掃仍要重算全部 n² 對)。
-  這是效益最大但改動面最大的一項(要動 `print_cache.py` schema + `find_similar_videos`
-  比對迴圈兩處)。**未開始,今晚時間不夠沒動工。**
+- [x] **配對結論快取**:`print_cache.py` 新增 `pairs` 表,key = `(key_a, key_b, fp_version,
+  base_interval, max_samples, frame_threshold, min_match_seconds)`,`key_a`/`key_b` 是
+  `content_id()`(把 `file_key()` 的 `size/mtime_ns/quick_hash` 壓成 16 bytes)排序後的組合
+  ——不含路徑,搬移/改名不影響命中,跟指紋快取同一套精神。value = `matched`(bool)+ 相似時
+  的 `a_start/a_end/b_start/b_end`(各自時間軸,秒)。**不相似的結論也存**,下次重掃一樣跳過。
+  - 實作上把 `find_similar_videos` 階段 2 原本內嵌在 `for j` 迴圈裡的比對邏輯(完全相同
+    指紋短路 / both_fine DP / 位移投票+精修)整段抽成獨立的巢狀函式 `_compare_pair(va, vb)
+    -> (matched, span)`,不碰 `assigned/members/segments`——這樣「查快取命中直接用結果」跟
+    「沒命中就照算」才能共用同一份判定邏輯,不必在兩條路各寫一份、也不會兩邊語意漂移。
+  - `_accept` 現在會把每部影片的 `content_id`(沒開快取或 `file_key` 失敗時為 `None`)存進
+    `videos[i]["content_id"]`;階段 2 對每一對先看兩邊 `content_id` 是否都非 `None`,是的話
+    才查/存配對快取,否則照舊直接算(不快取,但功能不受影響)。
+  - 取消時(`for i`/內層 `for j` 兩個 return 點)都補了 `cache.flush()`,已經存進 `pairs`
+    表的配對結論不會因為半路取消而遺失;正常結束時也在回傳前 flush 一次。
+  - 效能儀表:`_phase2_line` 與結尾的完成 log 都加了「配對快取命中 N」,方便日後比對
+    「重掃到底省了多少」。
+  - **新增測試 `test_cache` 內的配對快取段落**:同一批影片(A~B 相似、C 不相似)用同一個
+    `cache` 物件掃兩次,monkeypatch `sim._local_align`/`sim._estimate_offset` 計數,驗證
+    **重掃時這兩個函式完全不會被呼叫**(不是只驗證結果一樣——結果一樣但 DP 照跑不會被這種
+    測試抓到,之前 exact-duplicate fast path 那次已經吃過這個虧的反面教訓)。25/25 全綠。
+  - **效益必須實測,這裡沒有量測數字**:理論上「庫沒變、參數沒變的重掃」階段 2 會從
+    ~40 分鐘級降到幾乎瞬間(全部 pair 快取命中),但沒有在真實 3,400 部影片庫上跑過驗證,
+    比照 §8.6 的量測文化,回報效能前先跑一次「同資料夾掃兩次」比對 log 裡的
+    「配對快取命中」數字與階段 2 耗時。
 
 - [ ] **短片循序解碼**:時長 <= `base_interval × max_samples`(即間隔還沒被放寬,目前
   300 秒)的影片,`build_video_print` 目前仍用 `cap.set(POS_MSEC)` 隨機 seek 取樣;§8.6

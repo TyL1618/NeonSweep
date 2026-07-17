@@ -404,6 +404,48 @@ def test_cache(tmp: str) -> None:
     finally:
         cache.close()
 
+    # 配對結論快取(pairs 表):同一批影片重掃第二次,不該再呼叫 _local_align/_estimate_offset
+    # ——那是 both_fine/位移投票路徑最貴的部分,配對快取要整段跳過,不是只讓「結果一樣」而已。
+    d2 = os.path.join(tmp, "paircache")
+    os.makedirs(d2)
+    a = content_frames(seed=111, seconds=25)
+    b = content_frames(seed=222, seconds=25)
+    write_video(os.path.join(d2, "A.mp4"), a)
+    write_video(os.path.join(d2, "B.mp4"), a)   # 跟 A 相似(both_fine 路徑)
+    write_video(os.path.join(d2, "C.mp4"), b)   # 跟 A/B 都不相似(驗證「不相似」結論也被快取)
+
+    db2 = os.path.join(tmp, "pair_cache_test.db")
+    pair_cache = print_cache.PrintCache(db2)
+    try:
+        first = group_names(sim.find_similar_videos([d2], min_match_seconds=10, cache=pair_cache))
+        check("配對快取:首次掃描結果正確", first == [["A.mp4", "B.mp4"]], f"實際={first}")
+
+        orig_align, orig_offset = sim._local_align, sim._estimate_offset
+        calls = {"align": 0, "offset": 0}
+
+        def counting_align(*a_, **kw):
+            calls["align"] += 1
+            return orig_align(*a_, **kw)
+
+        def counting_offset(*a_, **kw):
+            calls["offset"] += 1
+            return orig_offset(*a_, **kw)
+
+        sim._local_align, sim._estimate_offset = counting_align, counting_offset
+        try:
+            second = group_names(sim.find_similar_videos([d2], min_match_seconds=10, cache=pair_cache))
+        finally:
+            sim._local_align, sim._estimate_offset = orig_align, orig_offset
+
+        check("配對快取:重掃結果不變", second == first, f"實際={second}")
+        check(
+            "配對快取:重掃不再呼叫 DP/位移投票(全部配對快取命中)",
+            calls["align"] == 0 and calls["offset"] == 0,
+            f"align 呼叫 {calls['align']} 次、offset 呼叫 {calls['offset']} 次(應皆為 0)",
+        )
+    finally:
+        pair_cache.close()
+
     # DB 損壞不能讓掃描炸掉(快取是純效能優化,壞掉最多是慢)
     with open(db, "wb") as fh:
         fh.write(b"this is definitely not a sqlite database" * 100)

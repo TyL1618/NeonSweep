@@ -51,6 +51,20 @@ CREATE TABLE IF NOT EXISTS prints (
     last_seen     INTEGER,
     PRIMARY KEY (size, mtime_ns, quick_hash, fp_version, base_interval, max_samples)
 );
+
+CREATE TABLE IF NOT EXISTS pairs (
+    key_a             BLOB    NOT NULL,
+    key_b             BLOB    NOT NULL,
+    fp_version        INTEGER NOT NULL,
+    base_interval     REAL    NOT NULL,
+    max_samples       INTEGER NOT NULL,
+    frame_threshold   INTEGER NOT NULL,
+    min_match_seconds REAL    NOT NULL,
+    matched           INTEGER NOT NULL,
+    a_start REAL, a_end REAL, b_start REAL, b_end REAL,
+    PRIMARY KEY (key_a, key_b, fp_version, base_interval, max_samples,
+                 frame_threshold, min_match_seconds)
+);
 """
 
 
@@ -74,6 +88,21 @@ def file_key(path: str) -> tuple[int, int, bytes] | None:
         return size, st.st_mtime_ns, h.digest()
     except OSError:
         return None
+
+
+def content_id(key: tuple[int, int, bytes] | None) -> bytes | None:
+    """把 file_key() 的 (size, mtime_ns, quick_hash) 壓成固定 16 bytes,給配對結論快取
+    (見 pairs 表)當穩定識別碼——理由跟 file_key 本身一樣:不含路徑,搬移/改名不影響命中。
+    key 為 None(讀不到檔案)時回傳 None,呼叫端據此判斷這個檔案不能參與配對快取。
+    """
+    if key is None:
+        return None
+    size, mtime_ns, quick = key
+    h = hashlib.blake2b(digest_size=16)
+    h.update(size.to_bytes(8, "little"))
+    h.update(mtime_ns.to_bytes(8, "little", signed=True))
+    h.update(quick)
+    return h.digest()
 
 
 class PrintCache:
@@ -203,6 +232,61 @@ class PrintCache:
                 self.flush()
         except (sqlite3.Error, KeyError) as e:
             logger.warning("指紋快取寫入失敗(跳過,不影響掃描):%s", e)
+
+    # ---------------------------------------------------------------- 配對結論(見 pairs 表)
+    def lookup_pair(
+        self, id_a: bytes, id_b: bytes, base_interval: float, max_samples: int,
+        frame_threshold: int, min_match_seconds: float,
+    ) -> dict | None:
+        """兩部影片(用 content_id() 算出的識別碼,呼叫端要先排序過,同一對不管誰先誰後
+        都查到同一列)這次比對的結論。回傳 None = 沒紀錄(要重新比對);
+        {"matched": False} = 之前比過、不相似;{"matched": True, "a_start"/"a_end"/
+        "b_start"/"b_end": ...} = 之前比過、相似,附相似區間(各自時間軸,秒)。
+        """
+        if self._conn is None:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT matched, a_start, a_end, b_start, b_end FROM pairs WHERE "
+                "key_a=? AND key_b=? AND fp_version=? AND base_interval=? AND max_samples=? "
+                "AND frame_threshold=? AND min_match_seconds=?",
+                (id_a, id_b, FP_VERSION, base_interval, max_samples, frame_threshold, min_match_seconds),
+            ).fetchone()
+        except sqlite3.Error as e:
+            logger.warning("配對結論快取查詢失敗(當成 miss):%s", e)
+            return None
+        if row is None:
+            return None
+        matched, a_start, a_end, b_start, b_end = row
+        if not matched:
+            return {"matched": False}
+        return {"matched": True, "a_start": a_start, "a_end": a_end, "b_start": b_start, "b_end": b_end}
+
+    def store_pair(
+        self, id_a: bytes, id_b: bytes, base_interval: float, max_samples: int,
+        frame_threshold: int, min_match_seconds: float, matched: bool,
+        span: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        if self._conn is None:
+            return
+        a_start = a_end = b_start = b_end = None
+        if matched and span is not None:
+            a_start, a_end, b_start, b_end = span
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO pairs (key_a, key_b, fp_version, base_interval, "
+                "max_samples, frame_threshold, min_match_seconds, matched, a_start, a_end, "
+                "b_start, b_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    id_a, id_b, FP_VERSION, base_interval, max_samples, frame_threshold,
+                    min_match_seconds, 1 if matched else 0, a_start, a_end, b_start, b_end,
+                ),
+            )
+            self._pending += 1
+            if self._pending >= _COMMIT_BATCH:
+                self.flush()
+        except sqlite3.Error as e:
+            logger.warning("配對結論快取寫入失敗(跳過,不影響掃描):%s", e)
 
     def flush(self) -> None:
         if self._conn is None:

@@ -663,12 +663,16 @@ def find_similar_videos(
                 el / 60, scanned, total, rate, left,
             )
 
-    def _accept(vp: dict, path: str) -> None:
-        """指紋(不管來自快取或現算)通過時長門檻就收進 videos。"""
+    def _accept(vp: dict, path: str, content_id: bytes | None = None) -> None:
+        """指紋(不管來自快取或現算)通過時長門檻就收進 videos。content_id 是配對結論快取
+        (見 print_cache.content_id/PrintCache.lookup_pair)用的穩定識別碼,None 代表這個
+        檔案不能參與配對快取(沒開快取,或 file_key 失敗),階段 2 遇到 None 就照舊算。
+        """
         if vp["duration"] < min_match_seconds:
             return
         vp["path"] = path            # 快取裡的 last_path 可能是這個檔案的舊位置,一律以現在的為準
         vp["group"] = path_group[path]
+        vp["content_id"] = content_id
         vp.setdefault("degenerate", _degenerate_mask(vp["hashes"]))
         videos.append(vp)
 
@@ -676,19 +680,22 @@ def find_similar_videos(
     # 數量級)。命中的直接用,只有 miss 才需要真的解碼。
     miss_paths = []
     miss_keys = {}
+    miss_cids: dict[str, bytes | None] = {}
     for p in paths:
         if cancelled():
             return []
         key = print_cache.file_key(p) if cache is not None else None
         vp = cache.lookup(key, base_interval, max_samples) if cache is not None else None
+        cid = print_cache.content_id(key) if cache is not None else None
         if vp is not None:
             # 只有命中才算「這部處理完了」。miss 的還要解碼,現在就記成已完成的話,進度條會在
             # 查快取階段就衝到 100%,然後在真正耗時的解碼階段整段卡在滿格不動。
             scanned += 1
-            _accept(vp, p)
+            _accept(vp, p, cid)
         else:
             miss_paths.append(p)
             miss_keys[p] = key
+            miss_cids[p] = cid
         _emit_phase1(p)   # 即使數字沒動也要發:UI 的路徑標籤會跟著跳,使用者才知道沒當掉
 
     # 階段 1c:平行算 miss 的粗篩指紋(cv2 的解碼呼叫會釋放 GIL,實測確實有平行加速)。
@@ -716,7 +723,7 @@ def find_similar_videos(
                     # 依它篩選過的快取會讓使用者改嚴格程度後莫名其妙 miss 一整輪。
                     if cache is not None:
                         cache.store(miss_keys[path], vp, base_interval, max_samples)
-                    _accept(vp, path)
+                    _accept(vp, path, miss_cids.get(path))
         if cache is not None:
             cache.flush()
 
@@ -772,7 +779,77 @@ def find_similar_videos(
     dp_calls = 0
     refine_calls = 0
     pruned_pairs = 0
+    pair_cache_hits = 0
     last_log = time.monotonic()
+
+    def _compare_pair(va: dict, vb: dict):
+        """判定這一對是否相似。回傳 (matched, span);span = (fa0,fa1,fb0,fb1)(各自時間軸上
+        的相似區間,秒)當 matched 為 True,否則 None。純比對邏輯,不碰 assigned/members/
+        segments——那些留給呼叫端(見下方 for j 迴圈),讓「怎麼判定」跟「命中配對結論快取時
+        要不要重新判定」共用同一個函式,不必在快取命中/未命中兩條路上各寫一份。
+        """
+        nonlocal dp_calls, refine_calls, pruned_pairs
+
+        if va["hashes"].shape == vb["hashes"].shape and np.array_equal(va["hashes"], vb["hashes"]):
+            # 指紋陣列逐 bit 相同:內容完全一致(常見於同一部影片重複下載、只是容器/編碼
+            # 參數不同),兩邊 Hamming 距離處處為 0,不必再跑 DP 或位移投票。
+            dup_dur = min(va["duration"], vb["duration"])
+            if dup_dur < min_match_seconds:
+                pruned_pairs += 1
+                return False, None
+            return True, (0.0, va["duration"], 0.0, vb["duration"])
+
+        both_fine = va["interval"] <= base_interval * 1.0001 and vb["interval"] <= base_interval * 1.0001
+
+        if both_fine:
+            # 兩邊都還沒被放寬(短片對短片),原生指紋本來就是同一個間隔,兩邊取樣起點都是
+            # 各自的 t=0、相位天生一致,直接對齊即可,不必再解一次影片。
+            match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold, va["degenerate"], vb["degenerate"])
+            if int(match.sum()) < required_match_frames:
+                pruned_pairs += 1
+                return False, None
+            dp_calls += 1
+            best, a0, a1, b0, b1, match_count = _local_align(
+                match.tolist(), len(va["hashes"]), len(vb["hashes"])
+            )
+            if best <= 0:
+                return False, None
+            matched_sec = match_count * base_interval
+            if matched_sec < min_match_seconds:
+                return False, None
+            return True, (a0 * base_interval, (a1 + 1) * base_interval, b0 * base_interval, (b1 + 1) * base_interval)
+
+        # 至少一邊牽涉到長片(間隔被放寬過):兩邊取樣的相位不保證對齊,改用位移投票找出候選
+        # 重疊窗,再把 B 的全長投影到 A 的時間軸上,只在那個窗附近精修。
+        offset, votes, hit_span = _estimate_offset(va, vb, frame_threshold)
+        if offset is None or votes < 2:
+            pruned_pairs += 1
+            return False, None
+        ta0 = max(0.0, offset)
+        ta1 = min(va["duration"], offset + vb["duration"])
+        if ta1 - ta0 < min_match_seconds:
+            pruned_pairs += 1
+            return False, None
+        # 把候選窗從「幾何重疊」收窄到「投票證據實際落在的範圍」(階段 2 最大的成本來源,
+        # 見 DEVDOC §8.6 的 _refine_match 說明)。
+        lo, hi = hit_span
+        pad = min_match_seconds + max(va["interval"], vb["interval"])
+        ta0 = max(ta0, lo - pad)
+        ta1 = min(ta1, hi + pad)
+        if ta1 - ta0 < min_match_seconds:
+            pruned_pairs += 1
+            return False, None
+        tb0, tb1 = ta0 - offset, ta1 - offset
+        refine_calls += 1
+        refined = _refine_match(
+            va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval, cancel_check
+        )
+        if refined is None:
+            return False, None
+        fa0, fa1, fb0, fb1, matched_sec = refined
+        if matched_sec < min_match_seconds:
+            return False, None
+        return True, (fa0, fa1, fb0, fb1)
 
     def _phase2_line(tag: str) -> str:
         el = time.monotonic() - t_phase2
@@ -781,11 +858,14 @@ def find_similar_videos(
         return (
             f"階段 2({tag}):{el / 60:.1f} 分鐘 | 已比對 {done_pairs}/{total_pairs_estimate} 對"
             f"({100 * done_pairs / max(total_pairs_estimate, 1):.1f}%,{rate:.0f} 對/秒,推估剩 {left:.0f} 分鐘)"
-            f" | 剪枝擋掉 {pruned_pairs}、進 DP {dp_calls} 次、進精修 {refine_calls} 次 | 目前 {len(result)} 組"
+            f" | 配對快取命中 {pair_cache_hits}、剪枝擋掉 {pruned_pairs}、進 DP {dp_calls} 次、"
+            f"進精修 {refine_calls} 次 | 目前 {len(result)} 組"
         )
 
     for i in range(n):
         if cancelled():
+            if cache is not None:
+                cache.flush()   # 已經存進去的配對結論別浪費,下次重掃還能跳過
             return []
         if assigned[i]:
             continue
@@ -804,6 +884,8 @@ def find_similar_videos(
             if cancelled():
                 # 內層每對都檢查:一對比對可能觸發精修(解碼兩段影片,分鐘等級),不能只在
                 # 錨點 i 的開頭檢查,否則按了取消還要等整輪候選跑完。
+                if cache is not None:
+                    cache.flush()
                 logger.info(_phase2_line("已取消"))
                 return []
             done_pairs += 1
@@ -815,84 +897,36 @@ def find_similar_videos(
                 last_log = now
                 logger.info(_phase2_line("進行中"))
 
-            if va["hashes"].shape == vb["hashes"].shape and np.array_equal(va["hashes"], vb["hashes"]):
-                # 指紋陣列逐 bit 相同:內容完全一致(常見於同一部影片重複下載、只是容器/編碼
-                # 參數不同),兩邊 Hamming 距離處處為 0,不必再跑 _match_matrix/_local_align 或
-                # 位移投票就已經知道整段相符。比照圖片那邊「完全相同先摺疊」的精神,但這裡不用
-                # 預先分桶——單純在配對當下用一次陣列比較短路掉本來要跑的 DP/位移投票,實作
-                # 更簡單、正確性顯而易見(陣列相同 ⇒ 距離必為 0,不會有假陽性)。
-                dup_dur = min(va["duration"], vb["duration"])
-                if dup_dur < min_match_seconds:
-                    pruned_pairs += 1
-                    continue
-                assigned[j] = True
-                members.append(j)
-                segments.append(
-                    f"{os.path.basename(va['path'])} {_fmt_ts(0.0)}–{_fmt_ts(va['duration'])}"
-                    f"  ≈  {os.path.basename(vb['path'])} {_fmt_ts(0.0)}–{_fmt_ts(vb['duration'])}"
-                )
+            # 配對結論快取(見 print_cache.py 的 pairs 表):兩部影片的內容識別碼都拿得到時
+            # (要開快取、且 file_key 沒失敗),先查有沒有比對過——庫沒變、參數沒變時整個
+            # DP/位移投票/精修都能跳過。id_a/id_b 排序過,同一對不管誰是錨點誰是候選都命中
+            # 同一列。未命中就照舊算,再把結論存回去(matched=False 也存,下次一樣跳過)。
+            pair_ids = None
+            if cache is not None and va.get("content_id") is not None and vb.get("content_id") is not None:
+                id_a, id_b = va["content_id"], vb["content_id"]
+                if id_a > id_b:
+                    id_a, id_b = id_b, id_a
+                pair_ids = (id_a, id_b)
+                cached = cache.lookup_pair(id_a, id_b, base_interval, max_samples, frame_threshold, min_match_seconds)
+            else:
+                cached = None
+
+            if cached is not None:
+                pair_cache_hits += 1
+                matched = cached["matched"]
+                span = (cached["a_start"], cached["a_end"], cached["b_start"], cached["b_end"]) if matched else None
+            else:
+                matched, span = _compare_pair(va, vb)
+                if pair_ids is not None:
+                    cache.store_pair(
+                        pair_ids[0], pair_ids[1], base_interval, max_samples,
+                        frame_threshold, min_match_seconds, matched, span,
+                    )
+
+            if not matched:
                 continue
 
-            both_fine = va["interval"] <= base_interval * 1.0001 and vb["interval"] <= base_interval * 1.0001
-
-            if both_fine:
-                # 兩邊都還沒被放寬(短片對短片),原生指紋本來就是同一個間隔,兩邊取樣起點都是
-                # 各自的 t=0、相位天生一致,直接對齊即可,不必再解一次影片。
-                match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold, va["degenerate"], vb["degenerate"])
-                if int(match.sum()) < required_match_frames:
-                    pruned_pairs += 1
-                    continue
-                dp_calls += 1
-                best, a0, a1, b0, b1, match_count = _local_align(
-                    match.tolist(), len(va["hashes"]), len(vb["hashes"])
-                )
-                if best <= 0:
-                    continue
-                matched_sec = match_count * base_interval
-                if matched_sec < min_match_seconds:
-                    continue
-                fa0, fa1 = a0 * base_interval, (a1 + 1) * base_interval
-                fb0, fb1 = b0 * base_interval, (b1 + 1) * base_interval
-            else:
-                # 至少一邊牽涉到長片(間隔被放寬過):兩邊取樣的相位不保證對齊,改用位移投票
-                # 找出候選重疊窗,再把 B 的全長投影到 A 的時間軸上,只在那個窗附近精修。
-                offset, votes, hit_span = _estimate_offset(va, vb, frame_threshold)
-                if offset is None or votes < 2:
-                    pruned_pairs += 1
-                    continue
-                ta0 = max(0.0, offset)
-                ta1 = min(va["duration"], offset + vb["duration"])
-                if ta1 - ta0 < min_match_seconds:
-                    pruned_pairs += 1
-                    continue
-                # 把候選窗從「幾何重疊」收窄到「投票證據實際落在的範圍」。這是階段 2 最大的
-                # 成本來源:兩部 30 分鐘影片在 offset≈0 時,幾何重疊 = 整整 1800 秒,精修會對
-                # 兩邊各取樣 VIDEO_REFINE_MAX_SAMPLES(600)次 = 1200 次 seek,傳統硬碟上光是
-                # 磁頭移動就要 ~14 秒——而絕大多數會走到這裡的配對其實只是 2 票的巧合,根本不
-                # 相似。收窄後,巧合配對的窗只有幾十秒(取樣數跟著掉一個數量級),真正的重疊
-                # 則因為投票樣本本來就散佈在整段重疊上,窗幾乎不變、精度不受影響。
-                #
-                # 為什麼不會漏抓:真的有 T 秒重疊時,粗篩會在整段 T 上取到 ~T/bucket 個樣本、
-                # 全部投給同一個位移,所以 hit_span 本來就涵蓋整段重疊。再往外墊
-                # min_match_seconds,讓「重疊比證據稍微長一點」的邊緣情況也有餘裕。
-                lo, hi = hit_span
-                pad = min_match_seconds + max(va["interval"], vb["interval"])
-                ta0 = max(ta0, lo - pad)
-                ta1 = min(ta1, hi + pad)
-                if ta1 - ta0 < min_match_seconds:
-                    pruned_pairs += 1
-                    continue
-                tb0, tb1 = ta0 - offset, ta1 - offset
-                refine_calls += 1
-                refined = _refine_match(
-                    va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval, cancel_check
-                )
-                if refined is None:
-                    continue
-                fa0, fa1, fb0, fb1, matched_sec = refined
-                if matched_sec < min_match_seconds:
-                    continue
-
+            fa0, fa1, fb0, fb1 = span
             assigned[j] = True
             members.append(j)
             segments.append(
@@ -903,14 +937,18 @@ def find_similar_videos(
         if len(members) >= 2:
             result.append({"paths": [videos[idx]["path"] for idx in members], "segments": segments})
 
+    if cache is not None:
+        cache.flush()   # 存進 pairs 表的配對結論要落地,下次重掃才吃得到
+
     phase2_sec = time.monotonic() - t_phase2
     logger.info(
         "階段 2(比對)完成:%.1f 秒 | 影片 %d 部、實際比對 %d 對(估計上限 %d)| "
-        "便宜剪枝擋掉 %d 對、進 DP %d 次、進精修 %d 次 | 產出 %d 組",
+        "配對快取命中 %d、便宜剪枝擋掉 %d 對、進 DP %d 次、進精修 %d 次 | 產出 %d 組",
         phase2_sec,
         n,
         done_pairs,
         total_pairs_estimate,
+        pair_cache_hits,
         pruned_pairs,
         dp_calls,
         refine_calls,
