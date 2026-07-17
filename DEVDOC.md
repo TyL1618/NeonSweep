@@ -880,6 +880,45 @@ third_party/smartmontools/
 - 不因為健康狀態異常就自動跳出「請立刻更換硬碟」之類的強烈警語彈窗——只在頁面上如實
   顯示數字與狀態,判斷交給使用者。
 
+### 13.4a 相似影片效能優化進行中(2026-07-17,對照 §8.6)
+
+使用者硬碟實測環境:約 3,400 部影片、800GB、小至數百 KB(3 秒)大至 3~4GB(2 小時)。
+§8.6 的「評估過不做」清單依然有效,別重提那四項。下面是根據 §8.6 量測數字規劃的優化,
+**進度追蹤用,做完一項就更新這裡,未完成項目照抄下方待辦不要憑印象重寫**:
+
+- [x] **短片提前跳過解碼**:`build_video_print` 加 `min_duration` 參數,時長不足時在算完
+  duration(免費的 metadata 讀取)後、進取樣迴圈(貴的 seek+decode)前就回傳 None。
+  `find_similar_videos` 呼叫時傳 `VIDEO_MIN_CACHEABLE_DURATION`(2.0 秒)這個**固定常數**,
+  刻意不用呼叫端這次的 `min_match_seconds`——後者是 UI 可調的,若拿它當跳過標準,使用者
+  改嚴格程度後,4~20 秒的影片會發現快取沒收它們、要重新解碼,等於重新引入 §8.6 已經修過的
+  「存快取要在 min_match_seconds 門檻之前」那個 bug。`VIDEO_MIN_CACHEABLE_DURATION` 必須
+  維持 `<= views/similarity_page.py::VIDEO_STRICTNESS_OPTIONS` 裡最寬鬆檔位的
+  `min_match_seconds`(目前「非常寬鬆」= 4 秒),兩處改動要一起看。測試:20/20 全綠
+  (`scripts/test_similarity.py` 沒有專門新增案例,因為既有的短片/精修測試都間接覆蓋到
+  「太短的候選被跳過」這條路徑,行為不變)。
+
+- [ ] **影片相同指紋摺疊去重**:比照 `find_similar_images` 的「完全相同 dHash 先收桶」,
+  影片的整份指紋陣列(`hashes`)若逐 bit 相同(重複下載的同一份內容,只是容器/編碼參數
+  不同),先摺疊成一桶,只對代表跑階段 2 比對,省下的量體看庫裡完全重複內容的比例。
+  **未開始。**
+
+- [ ] **階段 2 比對批次向量化**:同一個錨點 `i` 對所有候選 `j` 目前是逐對呼叫
+  `_match_matrix`(numpy 呼叫開銷佔比高),改成把候選 j 的 hashes 疊成一塊矩陣一次算,
+  再切片還原成 per-pair 結果。精修(有磁碟 I/O)維持逐對排隊,不要平行。**未開始。**
+
+- [ ] **配對結論快取**:`print_cache.py` 新增一張表,key = `(內容key_A, 內容key_B,
+  frame_threshold, min_match_seconds, FP_VERSION)` 排序後組合,value = 不相似 / 相似+
+  片段區間。庫沒變、參數沒變時,重掃可以跳過整個階段 2(目前每次重掃仍要重算全部 n² 對)。
+  這是效益最大但改動面最大的一項(要動 `print_cache.py` schema + `find_similar_videos`
+  比對迴圈兩處)。**未開始,今晚時間不夠沒動工。**
+
+- [ ] **短片循序解碼**:時長 <= `base_interval × max_samples`(即間隔還沒被放寬,目前
+  300 秒)的影片,`build_video_print` 目前仍用 `cap.set(POS_MSEC)` 隨機 seek 取樣;§8.6
+  量測過 HDD 上階段 1 的主導成本就是 seek 次數。提案是改成從頭循序 `grab()`/`retrieve()`
+  到尾,只在取樣時間點取幀——同一批取樣點、同一套 dHash,結果應逐 bit 相同(不用動
+  `FP_VERSION`),純粹換 I/O 模式。**未開始,而且效益需要在使用者的真實 HDD 上 A/B 才知道
+  (`NEONSWEEP_FP_WORKERS` 環境變數已經有,可以先測 worker 數本身的甜蜜點)。**
+
 ### 13.4 啟動畫面(`splash.png` / `NeonSweep.spec` 的 `Splash()`)
 
 onefile 打包的 exe,不管有沒有內嵌 smartctl.exe,本身就會因為要在啟動時解壓縮而有幾秒

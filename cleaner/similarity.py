@@ -82,6 +82,16 @@ VIDEO_DEGENERATE_POPCOUNT = 3
 # 只用在「影片」取樣路徑(_sample_window/build_video_print),刻意不動 image_dhash(圖片路徑)。
 WATERMARK_CROP_MARGIN = 0.10
 
+# 短片提前跳過解碼的安全底線。**必須 <= views/similarity_page.py 的 VIDEO_STRICTNESS_OPTIONS
+# 裡最寬鬆檔位的 min_match_seconds(目前「非常寬鬆」= 4 秒)**——刻意不直接用呼叫端傳進來的
+# min_match_seconds(那是 UI 可調的),因為指紋要進快取,而快取的存在意義就是跨掃描重用
+# (見 find_similar_videos 的 cache 說明:「存快取要在 min_match_seconds 門檻之前」)。
+# 如果拿目前這次的門檻當跳過標準,使用者從「標準」20 秒改選「非常寬鬆」4 秒後,4~20 秒
+# 之間的影片會發現快取沒有它們、要重新解碼——等於重新引入同一份文件警告過的那個 bug。
+# 這裡改用一個遠低於任何 UI 選項的固定常數,只濾掉真正不可能配對成功的極短片(使用者
+# 硬碟上大量 3 秒級的片段),不隨這次掃描的門檻變動,快取語意保持跨掃描一致。
+VIDEO_MIN_CACHEABLE_DURATION = 2.0
+
 # 取樣後端(指紋 dict 的 "backend" 欄位)。uniform = 等距時間點取樣(cv2,每個點都要
 # 從前一個關鍵幀解碼到目標時間);keyframe = 只解關鍵幀(PyAV,快得多但取樣點不等距)。
 # 兩者的指紋 dict 形狀相同,差別只在 times 是否等距——比對端一律吃 times,不必分兩套邏輯。
@@ -209,6 +219,7 @@ def build_video_print(
     base_interval: float = VIDEO_INTERVAL_SEC,
     max_samples: int = VIDEO_MAX_SAMPLES,
     cancel_check=None,
+    min_duration: float = 0.0,
 ):
     """單一影片的「原生」粗篩指紋。間隔依全片長度自動放寬(`max(base_interval, duration/max_samples)`),
     保證固定的 max_samples 個樣本點就能涵蓋全片——不會像固定間隔那樣,長片只取樣得到前面一小段
@@ -236,7 +247,9 @@ def build_video_print(
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
         duration = (frame_count / fps) if fps > 0 else 0.0
-        if duration <= 0:
+        if duration <= 0 or duration < min_duration:
+            # 只在確定拿到時長之後才提前回傳(這一步是免費的 metadata 讀取,不是 seek);
+            # 真正省下的是接下來的取樣迴圈(最多 max_samples 次 seek+decode)。
             return None
         interval = max(base_interval, duration / max_samples)
         hashes = []
@@ -683,7 +696,9 @@ def find_similar_videos(
     if miss_paths:
         with ThreadPoolExecutor(max_workers=fingerprint_workers) as executor:
             futures = {
-                executor.submit(build_video_print, p, base_interval, max_samples, cancel_check): p
+                executor.submit(
+                    build_video_print, p, base_interval, max_samples, cancel_check, VIDEO_MIN_CACHEABLE_DURATION
+                ): p
                 for p in miss_paths
             }
             for fut in as_completed(futures):
