@@ -300,6 +300,30 @@ def test_phase1_progress(tmp: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# 測試 8b:指紋陣列完全相同的快速通道(逐 bit 相同,免走 DP/位移投票)
+# ----------------------------------------------------------------------
+
+
+def test_exact_duplicate_fastpath(tmp: str) -> None:
+    """兩部影片指紋陣列逐 bit 相同(同內容、同 fps/長度,只是容器不同)時,應直接判定整段
+    相符,不必落到 both_fine 的 DP 或位移投票路徑——這裡驗證的是「結果仍正確」,不是走了
+    哪條程式碼路徑(白箱驗證留給人工讀 code,測試只看得到黑箱行為)。
+    """
+    d = os.path.join(tmp, "exact_dup")
+    os.makedirs(d)
+    frames = content_frames(seed=12345, seconds=30)
+    write_video(os.path.join(d, "orig.mp4"), frames, fourcc="mp4v")
+    write_video(os.path.join(d, "dup.avi"), frames, fourcc="MJPG")
+
+    groups = sim.find_similar_videos([d], min_match_seconds=10)
+    names = group_names(groups)
+    check("完全相同指紋:仍歸同組", names == [["dup.avi", "orig.mp4"]], f"實際={names}")
+    if groups:
+        seg = groups[0]["segments"][0]
+        check("完全相同指紋:相似片段涵蓋全片(非部分窗)", "00:00" in seg and "00:30" in seg, f"實際={seg}")
+
+
+# ----------------------------------------------------------------------
 # 測試 9:掃描期間的程序優先權
 # ----------------------------------------------------------------------
 
@@ -418,6 +442,8 @@ def main() -> int:
         test_cancel_responsive(tmp)
         print("[8] 階段 1 進度條")
         test_phase1_progress(tmp)
+        print("[8b] 完全相同指紋快速通道")
+        test_exact_duplicate_fastpath(tmp)
         print("[9] 程序優先權")
         test_background_priority()
         print("[10] 指紋快取")

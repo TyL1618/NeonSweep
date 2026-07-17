@@ -814,6 +814,25 @@ def find_similar_videos(
             if now - last_log >= PHASE2_LOG_INTERVAL:
                 last_log = now
                 logger.info(_phase2_line("進行中"))
+
+            if va["hashes"].shape == vb["hashes"].shape and np.array_equal(va["hashes"], vb["hashes"]):
+                # 指紋陣列逐 bit 相同:內容完全一致(常見於同一部影片重複下載、只是容器/編碼
+                # 參數不同),兩邊 Hamming 距離處處為 0,不必再跑 _match_matrix/_local_align 或
+                # 位移投票就已經知道整段相符。比照圖片那邊「完全相同先摺疊」的精神,但這裡不用
+                # 預先分桶——單純在配對當下用一次陣列比較短路掉本來要跑的 DP/位移投票,實作
+                # 更簡單、正確性顯而易見(陣列相同 ⇒ 距離必為 0,不會有假陽性)。
+                dup_dur = min(va["duration"], vb["duration"])
+                if dup_dur < min_match_seconds:
+                    pruned_pairs += 1
+                    continue
+                assigned[j] = True
+                members.append(j)
+                segments.append(
+                    f"{os.path.basename(va['path'])} {_fmt_ts(0.0)}–{_fmt_ts(va['duration'])}"
+                    f"  ≈  {os.path.basename(vb['path'])} {_fmt_ts(0.0)}–{_fmt_ts(vb['duration'])}"
+                )
+                continue
+
             both_fine = va["interval"] <= base_interval * 1.0001 and vb["interval"] <= base_interval * 1.0001
 
             if both_fine:
