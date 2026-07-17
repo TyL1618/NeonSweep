@@ -18,6 +18,19 @@ def icon_path() -> str:
     return os.path.join(app_root(), "icon.ico")
 
 
+def user_data_dir() -> str:
+    """程式自己的持久化資料目錄(log、指紋快取 DB…),不存在時建立。
+
+    刻意跟 app_root() 分開:frozen onefile 的 app_root() 是每次啟動都會重建/清掉的
+    _MEIPASS 暫存目錄,寫在那裡的東西下次啟動就沒了。這個路徑已經列在
+    analysis.EXCLUDED_DIRS,所以掃描不會把自己的快取當成使用者檔案掃進來
+    (改這裡的路徑時記得同步那份清單)。
+    """
+    path = os.path.expandvars(r"%LOCALAPPDATA%\NeonSweep")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def list_drives() -> list[str]:
     """回傳存在且為固定磁碟的磁碟機根目錄,如 ['C:\\', 'D:\\']"""
     DRIVE_FIXED = 3

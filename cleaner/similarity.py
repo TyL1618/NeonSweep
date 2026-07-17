@@ -11,6 +11,7 @@
 """
 
 import ctypes
+import logging
 import math
 import os
 import time
@@ -21,6 +22,11 @@ import numpy as np
 
 from .analysis import EXCLUDED_DIRS, IMAGE_EXTS, PROGRESS_TIME_INTERVAL, VIDEO_EXTS
 from .utils.fs import safe_walk
+
+# 效能儀表用(見 find_similar_videos 結尾的 logger.info)。這裡只取 logger、不掛 handler
+# 也不設 level——那是應用層的事(main.py 設檔案 handler,因為打包後 console=False,
+# 印到 stderr 使用者根本看不到)。純邏輯層自己設定 handler 會蓋掉呼叫端的配置。
+logger = logging.getLogger(__name__)
 
 # 只壓 OpenCV 自己的 [ERROR:...] log(解不開的圖片/影片本來就會被 image_dhash/build_video_print
 # 的 try/except 正常跳過,不影響掃描結果)。libpng 的 "libpng warning: ..." 是另一個函式庫自己
@@ -532,6 +538,8 @@ def find_similar_videos(
     def cancelled():
         return bool(cancel_check and cancel_check())
 
+    t_phase1 = time.monotonic()
+
     # 階段 1a:先蒐集所有影片路徑(快,不必平行化),這樣才能事先知道總數給進度條用。
     # group_b 模式下,path_group 記錄每個路徑屬於 A 或 B;若兩組資料夾有重疊/巢狀(同一個檔案
     # 兩邊都掃得到),以先蒐集到的 A 為準、B 端跳過,避免同一部影片被重複算指紋、跟自己比對出
@@ -579,6 +587,15 @@ def find_similar_videos(
                 vp["group"] = path_group[vp["path"]]
                 videos.append(vp)
 
+    phase1_sec = time.monotonic() - t_phase1
+    logger.info(
+        "階段 1(指紋)完成:%.1f 秒 | 影片檔 %d 個 → 可用指紋 %d 份(%d 個解不開或太短)",
+        phase1_sec,
+        total,
+        len(videos),
+        total - len(videos),
+    )
+
     n = len(videos)
     if n < 2:
         return []
@@ -608,6 +625,12 @@ def find_similar_videos(
     done_pairs = 0
     last_emit = 0.0
     result = []
+    # 效能儀表(Stage 0):這些計數只餵 logger,不影響任何判斷。dp_calls/refine_calls 是
+    # 階段 2 的成本大頭,pruned_pairs 則反映退化幀過濾 + match.sum() 剪枝擋掉多少昂貴路徑。
+    t_phase2 = time.monotonic()
+    dp_calls = 0
+    refine_calls = 0
+    pruned_pairs = 0
     for i in range(n):
         if cancelled():
             return []
@@ -642,7 +665,9 @@ def find_similar_videos(
                 # 各自的 t=0、相位天生一致,直接對齊即可,不必再解一次影片。
                 match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold, va["degenerate"], vb["degenerate"])
                 if int(match.sum()) < required_match_frames:
+                    pruned_pairs += 1
                     continue
+                dp_calls += 1
                 best, a0, a1, b0, b1, match_count = _local_align(
                     match.tolist(), len(va["hashes"]), len(vb["hashes"])
                 )
@@ -658,12 +683,15 @@ def find_similar_videos(
                 # 找出候選重疊窗,再把 B 的全長投影到 A 的時間軸上,只在那個窗附近精修。
                 offset, votes = _estimate_offset(va, vb, frame_threshold)
                 if offset is None or votes < 2:
+                    pruned_pairs += 1
                     continue
                 ta0 = max(0.0, offset)
                 ta1 = min(va["duration"], offset + vb["duration"])
                 if ta1 - ta0 < min_match_seconds:
+                    pruned_pairs += 1
                     continue
                 tb0, tb1 = ta0 - offset, ta1 - offset
+                refine_calls += 1
                 refined = _refine_match(
                     va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval, cancel_check
                 )
@@ -682,5 +710,20 @@ def find_similar_videos(
 
         if len(members) >= 2:
             result.append({"paths": [videos[idx]["path"] for idx in members], "segments": segments})
+
+    phase2_sec = time.monotonic() - t_phase2
+    logger.info(
+        "階段 2(比對)完成:%.1f 秒 | 影片 %d 部、實際比對 %d 對(估計上限 %d)| "
+        "便宜剪枝擋掉 %d 對、進 DP %d 次、進精修 %d 次 | 產出 %d 組",
+        phase2_sec,
+        n,
+        done_pairs,
+        total_pairs_estimate,
+        pruned_pairs,
+        dp_calls,
+        refine_calls,
+        len(result),
+    )
+    logger.info("相似影片掃描總計:%.1f 秒(階段 1:%.1f 秒、階段 2:%.1f 秒)", phase1_sec + phase2_sec, phase1_sec, phase2_sec)
 
     return result
