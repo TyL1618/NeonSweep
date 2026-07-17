@@ -230,7 +230,46 @@ def test_refine_window_bounded(tmp: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# 測試 7:階段 1 進度條(快取讓這條容易出錯)
+# 測試 7:取消回應性(build_video_print 內層要檢查取消旗標)
+# ----------------------------------------------------------------------
+
+
+def test_cancel_responsive(tmp: str) -> None:
+    """使用者實測回報:按下取消要多按幾次、等一陣子才生效。根因是 build_video_print 的
+    取樣迴圈完全不檢查 cancel_check——已經在解的影片會解完全部 max_samples(最多 300 次
+    seek)才停,不是這裡加了 cancel_check 就能馬上生效,而是「最多卡一次取樣的時間」而不是
+    「最多卡整部影片解完的時間」。
+
+    用計數式 cancel_check 直接驗證:影片有足夠多可取樣的秒數(遠超過 K),cancel_check 在
+    第 K 次呼叫時才回傳 True,呼叫次數必須剛好停在 K——如果迴圈沒有檢查旗標,呼叫次數會
+    一路衝到底(全部樣本數),不會停在 K。這個判準不靠計時(避免環境速度不同造成誤判),
+    直接測「有沒有真的檢查」。
+    """
+    d = os.path.join(tmp, "cancel")
+    os.makedirs(d)
+    # 100 秒、每秒可取一個樣本,遠超過下面的 K=5,才能區分「有停」跟「沒停一路衝到底」。
+    path = write_video(os.path.join(d, "long.mp4"), content_frames(seed=1, seconds=100))
+
+    K = 5
+    calls = {"n": 0}
+
+    def cancel_after_k():
+        calls["n"] += 1
+        return calls["n"] >= K
+
+    result = sim.build_video_print(path, cancel_check=cancel_after_k)
+
+    check("取消:cancel_check 觸發時立刻回傳 None(不回傳部分指紋)", result is None,
+          f"實際={type(result).__name__}")
+    check(
+        "取消:迴圈在第 K 次檢查就停,不會解完全部樣本",
+        calls["n"] == K,
+        f"cancel_check 被呼叫 {calls['n']} 次(應為 {K};遠大於 {K} 代表迴圈沒真的檢查旗標)",
+    )
+
+
+# ----------------------------------------------------------------------
+# 測試 8:階段 1 進度條(快取讓這條容易出錯)
 # ----------------------------------------------------------------------
 
 
@@ -261,7 +300,7 @@ def test_phase1_progress(tmp: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# 測試 8:掃描期間的程序優先權
+# 測試 9:掃描期間的程序優先權
 # ----------------------------------------------------------------------
 
 
@@ -290,7 +329,7 @@ def test_background_priority() -> None:
 
 
 # ----------------------------------------------------------------------
-# 測試 8:指紋快取(Stage 1 起;未實作時自動略過)
+# 測試 10:指紋快取(Stage 1 起;未實作時自動略過)
 # ----------------------------------------------------------------------
 
 
@@ -375,11 +414,13 @@ def main() -> int:
         test_long_video_coverage(tmp)
         print("[6] 精修窗收窄")
         test_refine_window_bounded(tmp)
-        print("[7] 階段 1 進度條")
+        print("[7] 取消回應性")
+        test_cancel_responsive(tmp)
+        print("[8] 階段 1 進度條")
         test_phase1_progress(tmp)
-        print("[8] 程序優先權")
+        print("[9] 程序優先權")
         test_background_priority()
-        print("[9] 指紋快取")
+        print("[10] 指紋快取")
         test_cache(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

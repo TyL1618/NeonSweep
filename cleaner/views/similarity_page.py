@@ -72,6 +72,7 @@ class SimilarityPage(QWidget):
         super().__init__(parent)
         self._thread = None
         self._worker = None
+        self._cancelling = False
         self._groups: list[list[dict]] = []
         self._group_segments: list[list[str]] = []
 
@@ -231,11 +232,11 @@ class SimilarityPage(QWidget):
         self._phase_path_label.setStyleSheet(f"color: {theme.TEXT_DIM}; font-family: Consolas; font-size: 9pt;")
         layout.addWidget(self._phase_path_label)
 
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self._cancel_scan)
+        self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.clicked.connect(self._cancel_scan)
         row = QHBoxLayout()
         row.addStretch(1)
-        row.addWidget(cancel_btn)
+        row.addWidget(self._cancel_btn)
         row.addStretch(1)
         layout.addLayout(row)
         layout.addStretch(1)
@@ -333,6 +334,9 @@ class SimilarityPage(QWidget):
             _name, threshold = IMAGE_STRICTNESS_OPTIONS[self._image_strict_combo.currentIndex()]
             min_match_seconds = 20  # 圖片模式用不到,給個值即可
 
+        self._cancelling = False
+        self._cancel_btn.setEnabled(True)
+        self._cancel_btn.setText("取消")
         self._phase_label.setText("正在計算指紋…")
         self._progress_bar.set_indeterminate(True)
         self._phase_path_label.setText("")
@@ -351,10 +355,23 @@ class SimilarityPage(QWidget):
         self._thread.start()
 
     def _cancel_scan(self) -> None:
-        if self._worker:
-            self._worker.cancel()
+        """按下取消要馬上有反應,不然使用者以為沒按到、多按幾次(見 DEVDOC §10.1:
+        worker 內部現在每個樣本都會檢查取消旗標,單一部影片最多卡一次 seek+解碼的時間就會
+        停,但那仍然是「有感覺的延遲」,不是瞬間——UI 這邊先給視覺回饋,不要留白等 worker
+        真正退出。_cancelling 旗標讓 _on_progress 不要再用新進度蓋掉這則訊息。
+        """
+        if not self._worker:
+            return
+        self._worker.cancel()
+        self._cancelling = True
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("取消中…")
+        self._phase_label.setText("正在取消…請稍候(可能還要等在途的影片解碼完成)")
+        self._progress_bar.set_indeterminate(True)
 
     def _on_progress(self, phase: int, done: int, total: int, path: str) -> None:
+        if self._cancelling:
+            return   # 取消訊息已經顯示,後續進度(在途工作收尾)不要蓋掉它
         metrics = QFontMetrics(self._phase_path_label.font())
         self._phase_path_label.setText(metrics.elidedText(path, Qt.TextElideMode.ElideMiddle, PATH_ELIDE_WIDTH))
         if phase == 1:

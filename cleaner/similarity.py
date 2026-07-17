@@ -204,7 +204,12 @@ def _sample_window(
         cap.release()
 
 
-def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_samples: int = VIDEO_MAX_SAMPLES):
+def build_video_print(
+    path: str,
+    base_interval: float = VIDEO_INTERVAL_SEC,
+    max_samples: int = VIDEO_MAX_SAMPLES,
+    cancel_check=None,
+):
     """單一影片的「原生」粗篩指紋。間隔依全片長度自動放寬(`max(base_interval, duration/max_samples)`),
     保證固定的 max_samples 個樣本點就能涵蓋全片——不會像固定間隔那樣,長片只取樣得到前面一小段
     (例如 60 分鐘的影片若固定每秒取樣、上限 300 個樣本,只能涵蓋前 5 分鐘,中後段被剪出來的
@@ -217,6 +222,12 @@ def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_
     `times` 在這條均勻取樣路徑就是 `arange(n) * interval`,看似多餘,但指紋 dict 的形狀要跟
     非均勻取樣的後端(見 "backend" 欄位)一致,比對端才能一律用真實時間戳算位移、不必分兩套
     邏輯;快取 schema 也因此不用隨後端增加而遷移。
+
+    cancel_check:**這是取消按鈕能不能即時生效的關鍵**(DEVDOC §10.1:長迴圈的取消要放在真正
+    耗時的內層)。每個樣本(一次 seek + 解碼)都檢查一次——這個函式是階段 1 平行執行緒裡真正
+    在跑的工作,取消旗標設下去之後,已經在解的影片如果不檢查這個,會解完全部 max_samples
+    (最多 300 次 seek)才會停,使用者按下取消要等好一陣子才有反應。取消時回傳 None(等同
+    「這部沒解出東西」),跟其他失敗路徑一致——反正整個掃描都要中止了,這部有沒有指紋不重要。
     """
     cap = _open_capture(path)
     if cap is None:
@@ -231,6 +242,8 @@ def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_
         hashes = []
         t = 0.0
         while t < duration and len(hashes) < max_samples:
+            if cancel_check and cancel_check():
+                return None
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
             ok, frame = cap.read()
             if not ok:
@@ -670,7 +683,8 @@ def find_similar_videos(
     if miss_paths:
         with ThreadPoolExecutor(max_workers=fingerprint_workers) as executor:
             futures = {
-                executor.submit(build_video_print, p, base_interval, max_samples): p for p in miss_paths
+                executor.submit(build_video_print, p, base_interval, max_samples, cancel_check): p
+                for p in miss_paths
             }
             for fut in as_completed(futures):
                 if cancelled():
