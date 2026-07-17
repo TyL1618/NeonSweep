@@ -49,6 +49,10 @@ VIDEO_REFINE_MAX_SAMPLES = 600  # 精修階段單邊取樣上限:候選窗可能
                                 # 的 O(na*nb) DP 會隨窗長無上限膨脹(見 _refine_match)
 VIDEO_FRAME_THRESHOLD = 10   # 兩幀 dHash 視為「相同畫面」的 Hamming 上限
 
+# 階段 2 每隔幾秒寫一行進度到 log。大型影片庫的階段 2 要跑數小時,只在結束時記錄的話,
+# 掃到一半去看 log、或中途按取消,都完全拿不到數字——正要拿它診斷效能時最需要的就是那些數字。
+PHASE2_LOG_INTERVAL = 60.0
+
 # 平行算指紋的執行緒數,偏保守——傳統硬碟上開太多平行 seek 反而互相拖累。
 # 4 是沒有實測數據下的猜測(見 DEVDOC §8.6);HDD 的最佳值跟磁碟、影片大小、檔案碎片化都有關,
 # 只能在真實影片庫上量。用環境變數覆寫,方便在目標機器上 A/B 找出甜蜜點,不必改程式重打包:
@@ -613,14 +617,25 @@ def find_similar_videos(
     scanned = 0
     last_emit = 0.0
 
+    last_log = 0.0
+
     def _emit_phase1(path: str) -> None:
-        nonlocal last_emit
-        if not progress_cb:
-            return
+        nonlocal last_emit, last_log
         now = time.monotonic()
-        if now - last_emit >= PROGRESS_TIME_INTERVAL:
+        if progress_cb and now - last_emit >= PROGRESS_TIME_INTERVAL:
             last_emit = now
             progress_cb(1, scanned, total, path)
+        # 心跳:階段 1 在大型影片庫上要跑上一小時,中途沒有任何 log 的話,想診斷「現在到底
+        # 卡在哪、有沒有在動」只能用猜的。
+        if now - last_log >= PHASE2_LOG_INTERVAL:
+            last_log = now
+            el = now - t_phase1
+            rate = scanned / el if el > 0 else 0.0
+            left = (total - scanned) / rate / 60 if rate > 0 else 0.0
+            logger.info(
+                "階段 1(進行中):%.1f 分鐘 | 已處理 %d/%d 部(%.0f 部/秒,推估剩 %.0f 分鐘)",
+                el / 60, scanned, total, rate, left,
+            )
 
     def _accept(vp: dict, path: str) -> None:
         """指紋(不管來自快取或現算)通過時長門檻就收進 videos。"""
@@ -640,13 +655,15 @@ def find_similar_videos(
             return []
         key = print_cache.file_key(p) if cache is not None else None
         vp = cache.lookup(key, base_interval, max_samples) if cache is not None else None
-        scanned += 1
-        _emit_phase1(p)
         if vp is not None:
+            # 只有命中才算「這部處理完了」。miss 的還要解碼,現在就記成已完成的話,進度條會在
+            # 查快取階段就衝到 100%,然後在真正耗時的解碼階段整段卡在滿格不動。
+            scanned += 1
             _accept(vp, p)
         else:
             miss_paths.append(p)
             miss_keys[p] = key
+        _emit_phase1(p)   # 即使數字沒動也要發:UI 的路徑標籤會跟著跳,使用者才知道沒當掉
 
     # 階段 1c:平行算 miss 的粗篩指紋(cv2 的解碼呼叫會釋放 GIL,實測確實有平行加速)。
     # worker 數偏保守——傳統硬碟上開太多平行 seek 反而會互相拖累。
@@ -663,6 +680,8 @@ def find_similar_videos(
                     return []
                 path = futures[fut]
                 vp = fut.result()
+                scanned += 1
+                _emit_phase1(path)
                 if vp is not None:
                     # 存快取要在時長門檻之前——min_match_seconds 是 UI 可調的,指紋本身跟它無關,
                     # 依它篩選過的快取會讓使用者改嚴格程度後莫名其妙 miss 一整輪。
@@ -724,6 +743,18 @@ def find_similar_videos(
     dp_calls = 0
     refine_calls = 0
     pruned_pairs = 0
+    last_log = time.monotonic()
+
+    def _phase2_line(tag: str) -> str:
+        el = time.monotonic() - t_phase2
+        rate = done_pairs / el if el > 0 else 0.0
+        left = (total_pairs_estimate - done_pairs) / rate / 60 if rate > 0 else 0.0
+        return (
+            f"階段 2({tag}):{el / 60:.1f} 分鐘 | 已比對 {done_pairs}/{total_pairs_estimate} 對"
+            f"({100 * done_pairs / max(total_pairs_estimate, 1):.1f}%,{rate:.0f} 對/秒,推估剩 {left:.0f} 分鐘)"
+            f" | 剪枝擋掉 {pruned_pairs}、進 DP {dp_calls} 次、進精修 {refine_calls} 次 | 目前 {len(result)} 組"
+        )
+
     for i in range(n):
         if cancelled():
             return []
@@ -744,13 +775,16 @@ def find_similar_videos(
             if cancelled():
                 # 內層每對都檢查:一對比對可能觸發精修(解碼兩段影片,分鐘等級),不能只在
                 # 錨點 i 的開頭檢查,否則按了取消還要等整輪候選跑完。
+                logger.info(_phase2_line("已取消"))
                 return []
             done_pairs += 1
-            if progress_cb:
-                now = time.monotonic()
-                if now - last_emit >= PROGRESS_TIME_INTERVAL:
-                    last_emit = now
-                    progress_cb(2, done_pairs, total_pairs_estimate, va["path"])
+            now = time.monotonic()
+            if progress_cb and now - last_emit >= PROGRESS_TIME_INTERVAL:
+                last_emit = now
+                progress_cb(2, done_pairs, total_pairs_estimate, va["path"])
+            if now - last_log >= PHASE2_LOG_INTERVAL:
+                last_log = now
+                logger.info(_phase2_line("進行中"))
             both_fine = va["interval"] <= base_interval * 1.0001 and vb["interval"] <= base_interval * 1.0001
 
             if both_fine:

@@ -230,7 +230,38 @@ def test_refine_window_bounded(tmp: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# 測試 7:掃描期間的程序優先權
+# 測試 7:階段 1 進度條(快取讓這條容易出錯)
+# ----------------------------------------------------------------------
+
+
+def test_phase1_progress(tmp: str) -> None:
+    """進度回報的 done 只能算「真的處理完的影片」。
+
+    踩過的雷:加了快取之後,查快取的迴圈把 done 一路加到 total,但真正的解碼在那之後才開始
+    ——進度條會先衝到 100%,然後在最耗時的解碼階段整段卡在滿格。結果完全正確,所以測試分群
+    的案例抓不到,只有使用者會看到「卡住的 100%」。
+    """
+    d = os.path.join(tmp, "prog")
+    os.makedirs(d)
+    for i in range(4):
+        write_video(os.path.join(d, f"p{i}.mp4"), content_frames(seed=700 + i, seconds=25))
+
+    seen: list[tuple[int, int]] = []
+    sim.find_similar_videos(
+        [d], min_match_seconds=10,
+        progress_cb=lambda phase, done, total, path: seen.append((done, total)) if phase == 1 else None,
+    )
+    check("階段 1 進度:done 不超過 total", all(d_ <= t_ for d_, t_ in seen), f"越界樣本={[x for x in seen if x[0] > x[1]][:3]}")
+
+    # 這裡沒給 cache,所以每一部都是 miss、都還要解碼——**第一次回報時 done 必須是 0**。
+    # 這正是抓那個 bug 的判準:當時查快取的迴圈對每個路徑都 scanned += 1,所以第一次回報就會
+    # 是 done=1,查完 4 部就直接 4/4 滿格,而解碼一幀都還沒開始。
+    check("階段 1 進度:解碼開始前不得回報任何「已完成」", bool(seen) and seen[0][0] == 0,
+          f"首次回報={seen[0] if seen else '(完全沒回報)'},應為 (0, 4)")
+
+
+# ----------------------------------------------------------------------
+# 測試 8:掃描期間的程序優先權
 # ----------------------------------------------------------------------
 
 
@@ -344,9 +375,11 @@ def main() -> int:
         test_long_video_coverage(tmp)
         print("[6] 精修窗收窄")
         test_refine_window_bounded(tmp)
-        print("[7] 程序優先權")
+        print("[7] 階段 1 進度條")
+        test_phase1_progress(tmp)
+        print("[8] 程序優先權")
         test_background_priority()
-        print("[8] 指紋快取")
+        print("[9] 指紋快取")
         test_cache(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
