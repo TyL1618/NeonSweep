@@ -240,6 +240,19 @@ def test_cache(tmp: str) -> None:
     finally:
         cache.close()
 
+    # DB 損壞不能讓掃描炸掉(快取是純效能優化,壞掉最多是慢)
+    with open(db, "wb") as fh:
+        fh.write(b"this is definitely not a sqlite database" * 100)
+    try:
+        broken = print_cache.PrintCache(db)
+        try:
+            groups = group_names(sim.find_similar_videos([d], min_match_seconds=10, cache=broken))
+            check("快取:DB 損壞時自動重建、掃描照常完成", isinstance(groups, list))
+        finally:
+            broken.close()
+    except Exception as e:
+        check("快取:DB 損壞時自動重建、掃描照常完成", False, f"丟出例外={e!r}")
+
 
 # ----------------------------------------------------------------------
 

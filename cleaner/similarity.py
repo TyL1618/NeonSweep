@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 
+from . import print_cache
 from .analysis import EXCLUDED_DIRS, IMAGE_EXTS, PROGRESS_TIME_INTERVAL, VIDEO_EXTS
 from .utils.fs import safe_walk
 
@@ -58,6 +59,11 @@ VIDEO_DEGENERATE_POPCOUNT = 3
 # 浮水印寬容度:算指紋前先裁掉四邊各這個比例,避開角落/邊緣常見的浮水印位置。
 # 只用在「影片」取樣路徑(_sample_window/build_video_print),刻意不動 image_dhash(圖片路徑)。
 WATERMARK_CROP_MARGIN = 0.10
+
+# 取樣後端(指紋 dict 的 "backend" 欄位)。uniform = 等距時間點取樣(cv2,每個點都要
+# 從前一個關鍵幀解碼到目標時間);keyframe = 只解關鍵幀(PyAV,快得多但取樣點不等距)。
+# 兩者的指紋 dict 形狀相同,差別只在 times 是否等距——比對端一律吃 times,不必分兩套邏輯。
+BACKEND_UNIFORM = "uniform"
 
 # Smith-Waterman 計分
 _SW_MATCH = 2
@@ -183,7 +189,12 @@ def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_
     片段會完全偵測不到)。**時長 <= base_interval × max_samples 的短片,間隔仍是 base_interval,
     精細度完全不受影響**——放寬只發生在真正需要的長片上。
 
-    回傳 dict {"path","duration","interval","hashes"(np.uint64 array)},讀不到回傳 None。
+    回傳 dict {"path","duration","interval","hashes"(np.uint64),"times"(np.float64,
+    每個樣本的實際時間戳),"backend"},讀不到回傳 None。
+
+    `times` 在這條均勻取樣路徑就是 `arange(n) * interval`,看似多餘,但指紋 dict 的形狀要跟
+    非均勻取樣的後端(見 "backend" 欄位)一致,比對端才能一律用真實時間戳算位移、不必分兩套
+    邏輯;快取 schema 也因此不用隨後端增加而遷移。
     """
     cap = _open_capture(path)
     if cap is None:
@@ -213,6 +224,8 @@ def build_video_print(path: str, base_interval: float = VIDEO_INTERVAL_SEC, max_
             "duration": duration,
             "interval": interval,
             "hashes": hashes_arr,
+            "times": np.arange(len(hashes), dtype=np.float64) * interval,
+            "backend": BACKEND_UNIFORM,
             "degenerate": _degenerate_mask(hashes_arr),
         }
     except Exception:
@@ -511,10 +524,16 @@ def find_similar_videos(
     cancel_check=None,
     fingerprint_workers=VIDEO_FINGERPRINT_WORKERS,
     group_b=None,
+    cache=None,
 ):
     """回傳 list[dict],每組:{"paths": [...], "segments": [人類可讀的相似片段字串, ...]}。
     min_match_seconds:最短連續相似片段(秒),過濾黑畫面/共用片頭之類的巧合匹配。
     fingerprint_workers:階段 1 平行算指紋的執行緒數(cv2 解碼會釋放 GIL,執行緒能真的平行跑)。
+
+    cache:選填的 print_cache.PrintCache。給定時,沒動過的影片直接讀快取、完全不解碼
+    (見 print_cache 模組說明)。**這個物件只會在呼叫端這條執行緒上被碰**——查快取在丟給
+    ThreadPoolExecutor 之前做完,寫回也只在 as_completed 迴圈裡做,sqlite 連線不跨執行緒。
+    None 時完全不快取(純函式行為,測試用)。
 
     group_b:給定時進入「資料夾對資料夾」模式——targets 視為群組 A、group_b 視為群組 B,
     最終結果只保留跨群組的配對(A 跟 A 自己、B 跟 B 自己都不比對)。預設 None 時完全不影響
@@ -562,38 +581,82 @@ def find_similar_videos(
                     path_group[entry.path] = "B"
                     paths.append(entry.path)
 
-    # 階段 1b:平行算每部影片的粗篩指紋(cv2 的解碼呼叫會釋放 GIL,實測確實有平行加速)。
-    # worker 數偏保守——傳統硬碟上開太多平行 seek 反而會互相拖累。
-    videos = []  # list[dict]:build_video_print 的回傳(順序不保證跟 paths 一致,分群不受影響)
+    videos = []  # list[dict]:指紋(順序不保證跟 paths 一致,分群不受影響)
     total = len(paths)
     scanned = 0
     last_emit = 0.0
-    with ThreadPoolExecutor(max_workers=fingerprint_workers) as executor:
-        futures = {
-            executor.submit(build_video_print, p, base_interval, max_samples): p for p in paths
-        }
-        for fut in as_completed(futures):
-            if cancelled():
-                executor.shutdown(wait=False, cancel_futures=True)
-                return []
-            scanned += 1
-            if progress_cb:
-                now = time.monotonic()
-                if now - last_emit >= PROGRESS_TIME_INTERVAL:
-                    last_emit = now
-                    progress_cb(1, scanned, total, futures[fut])
-            vp = fut.result()
-            if vp is not None and vp["duration"] >= min_match_seconds:
-                vp["group"] = path_group[vp["path"]]
-                videos.append(vp)
+
+    def _emit_phase1(path: str) -> None:
+        nonlocal last_emit
+        if not progress_cb:
+            return
+        now = time.monotonic()
+        if now - last_emit >= PROGRESS_TIME_INTERVAL:
+            last_emit = now
+            progress_cb(1, scanned, total, path)
+
+    def _accept(vp: dict, path: str) -> None:
+        """指紋(不管來自快取或現算)通過時長門檻就收進 videos。"""
+        if vp["duration"] < min_match_seconds:
+            return
+        vp["path"] = path            # 快取裡的 last_path 可能是這個檔案的舊位置,一律以現在的為準
+        vp["group"] = path_group[path]
+        vp.setdefault("degenerate", _degenerate_mask(vp["hashes"]))
+        videos.append(vp)
+
+    # 階段 1b:先查快取(協調執行緒、順序 I/O:每檔只 stat + 讀頭尾各 64KB,比解碼便宜好幾個
+    # 數量級)。命中的直接用,只有 miss 才需要真的解碼。
+    miss_paths = []
+    miss_keys = {}
+    for p in paths:
+        if cancelled():
+            return []
+        key = print_cache.file_key(p) if cache is not None else None
+        vp = cache.lookup(key, base_interval, max_samples) if cache is not None else None
+        scanned += 1
+        _emit_phase1(p)
+        if vp is not None:
+            _accept(vp, p)
+        else:
+            miss_paths.append(p)
+            miss_keys[p] = key
+
+    # 階段 1c:平行算 miss 的粗篩指紋(cv2 的解碼呼叫會釋放 GIL,實測確實有平行加速)。
+    # worker 數偏保守——傳統硬碟上開太多平行 seek 反而會互相拖累。
+    if miss_paths:
+        with ThreadPoolExecutor(max_workers=fingerprint_workers) as executor:
+            futures = {
+                executor.submit(build_video_print, p, base_interval, max_samples): p for p in miss_paths
+            }
+            for fut in as_completed(futures):
+                if cancelled():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    if cache is not None:
+                        cache.flush()   # 已經算好的別浪費,下次掃描還能用
+                    return []
+                path = futures[fut]
+                vp = fut.result()
+                if vp is not None:
+                    # 存快取要在時長門檻之前——min_match_seconds 是 UI 可調的,指紋本身跟它無關,
+                    # 依它篩選過的快取會讓使用者改嚴格程度後莫名其妙 miss 一整輪。
+                    if cache is not None:
+                        cache.store(miss_keys[path], vp, base_interval, max_samples)
+                    _accept(vp, path)
+        if cache is not None:
+            cache.flush()
 
     phase1_sec = time.monotonic() - t_phase1
+    cache_note = ""
+    if cache is not None:
+        st = cache.stats()
+        cache_note = f" | 快取命中 {st['hits']}、未命中 {st['misses']}"
     logger.info(
-        "階段 1(指紋)完成:%.1f 秒 | 影片檔 %d 個 → 可用指紋 %d 份(%d 個解不開或太短)",
+        "階段 1(指紋)完成:%.1f 秒 | 影片檔 %d 個 → 可用指紋 %d 份(%d 個解不開或太短)%s",
         phase1_sec,
         total,
         len(videos),
         total - len(videos),
+        cache_note,
     )
 
     n = len(videos)

@@ -280,8 +280,19 @@ class SimilarityWorker(QObject):
         emit = lambda phase, done, total, path: self.progress.emit(phase, done, total, path)
         cancel = lambda: self._cancelled
         result = []
+        cache = None
         try:
             if self._mode == "video":
+                # 指紋快取只有影片路徑需要(圖片算 dHash 只解一張圖,本來就便宜)。
+                # 建不起來(磁碟滿、目錄不可寫)不該讓掃描失敗,PrintCache 內部已降級成
+                # 「不快取」,這裡的 except 只防 import 層級的意外。
+                try:
+                    from .print_cache import PrintCache
+
+                    cache = PrintCache()
+                except Exception:
+                    traceback.print_exc()
+                    cache = None
                 raw = similarity.find_similar_videos(
                     self._targets,
                     min_match_seconds=self._min_match_seconds,
@@ -289,6 +300,7 @@ class SimilarityWorker(QObject):
                     progress_cb=emit,
                     cancel_check=cancel,
                     group_b=self._group_b,
+                    cache=cache,
                 )
                 result = [{"paths": d["paths"], "segments": d["segments"], "kind": "video"} for d in raw]
             else:
@@ -300,6 +312,8 @@ class SimilarityWorker(QObject):
             traceback.print_exc()
             self.error.emit(f"相似偵測發生未預期錯誤:{e}")
         finally:
+            if cache is not None:
+                cache.close()
             self.finished.emit(result)
 
 
