@@ -35,6 +35,11 @@ PATH_ELIDE_WIDTH = 480
 MAX_RENDERED_GROUPS = 500  # 結果樹一次最多鋪幾組(依最大檔案遞減取前段);其餘只計數,避免建到卡死
 TYPE_FILTERS = [("image", "圖片"), ("video", "影片")]
 
+# 比對範圍:全部互比(現有行為,預設)/ 資料夾對資料夾(只比群組 A×B,A/B 各自內部不互比)。
+# 只有影片支援後者——圖片路徑有「完全相同雜湊先摺疊成桶」的優化,桶內成員可能同時混著兩組
+# 檔案,硬要疊加跨群組過濾會明顯複雜化,而圖片比對本來就不是效能痛點,故刻意不做。
+SCOPE_FILTERS = [("all", "全部互比"), ("cross", "資料夾對資料夾")]
+
 # 圖片:(標籤, Hamming 門檻)——兩張圖的 64-bit dHash 指紋逐 bit 比對,不同的 bit 數 <= 門檻才算相似。
 IMAGE_STRICTNESS_OPTIONS = [
     ("寬鬆", 14),
@@ -105,6 +110,25 @@ class SimilarityPage(QWidget):
         self._type_chips.selection_changed.connect(self._on_type_changed)
         layout.addWidget(self._type_chips)
 
+        scope_row = QHBoxLayout()
+        scope_label = QLabel("比對範圍:")
+        scope_label.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        scope_row.addWidget(scope_label)
+        self._scope_chips = ChipRow(items=SCOPE_FILTERS, default_checked={"all"}, exclusive=True)
+        self._scope_chips.selection_changed.connect(self._on_scope_changed)
+        scope_row.addWidget(self._scope_chips)
+        scope_row.addStretch(1)
+        layout.addLayout(scope_row)
+
+        self._scope_hint = QLabel(
+            "只比對群組 A 與群組 B 之間的影片(A 內部、B 內部不互比),"
+            "適合「新資料夾 vs 已整理歸檔」這類場景。只支援影片,類型已鎖定。"
+        )
+        self._scope_hint.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 9pt;")
+        self._scope_hint.setWordWrap(True)
+        self._scope_hint.setVisible(False)
+        layout.addWidget(self._scope_hint)
+
         strict_row = QHBoxLayout()
         strict_label = QLabel("相似程度:")
         strict_label.setStyleSheet(f"color: {theme.TEXT_DIM};")
@@ -136,6 +160,13 @@ class SimilarityPage(QWidget):
         )
         layout.addWidget(self._folder_picker)
 
+        self._folder_picker_a = FolderPicker(hint="群組 A:新增資料夾(含子目錄)。")
+        self._folder_picker_b = FolderPicker(hint="群組 B:新增資料夾(含子目錄)。只比對 A×B 之間的影片。")
+        self._folder_picker_a.setVisible(False)
+        self._folder_picker_b.setVisible(False)
+        layout.addWidget(self._folder_picker_a)
+        layout.addWidget(self._folder_picker_b)
+
         layout.addStretch(1)
 
         start_btn = QPushButton("開始掃描")
@@ -162,6 +193,23 @@ class SimilarityPage(QWidget):
     def _current_mode(self) -> str:
         keys = self._type_chips.checked_keys()
         return keys[0] if keys else "image"
+
+    def _on_scope_changed(self) -> None:
+        cross = self._current_scope() == "cross"
+        self._drive_chips.setVisible(not cross)
+        self._folder_picker.setVisible(not cross)
+        self._folder_picker_a.setVisible(cross)
+        self._folder_picker_b.setVisible(cross)
+        self._scope_hint.setVisible(cross)
+        # 圖片模式不支援資料夾對資料夾(見 SCOPE_FILTERS 說明),進入 cross 範圍時鎖死成影片。
+        self._type_chips.chip("image").setEnabled(not cross)
+        if cross:
+            self._type_chips.chip("video").setChecked(True)
+        self._on_type_changed()
+
+    def _current_scope(self) -> str:
+        keys = self._scope_chips.checked_keys()
+        return keys[0] if keys else "all"
 
     # -------------------------------------------------------------- SCANNING
     def _build_scanning_page(self) -> QWidget:
@@ -263,11 +311,22 @@ class SimilarityPage(QWidget):
 
     # ----------------------------------------------------------------- SCAN
     def _start_scan(self) -> None:
-        folders = self._folder_picker.selected_folders()
-        targets = folders if folders else self._drive_chips.checked_keys()
-        if not targets:
-            return
-        mode = self._current_mode()
+        scope = self._current_scope()
+        group_b = None
+        if scope == "cross":
+            targets = self._folder_picker_a.selected_folders()
+            group_b = self._folder_picker_b.selected_folders()
+            if not targets or not group_b:
+                QMessageBox.warning(self, "資料夾對資料夾", "請至少為群組 A、群組 B 各新增一個資料夾。")
+                return
+            mode = "video"  # UI 已鎖定類型,這裡再保險一次,避免任何殘留狀態繞過限制
+        else:
+            folders = self._folder_picker.selected_folders()
+            targets = folders if folders else self._drive_chips.checked_keys()
+            if not targets:
+                return
+            mode = self._current_mode()
+
         if mode == "video":
             _name, threshold, min_match_seconds = VIDEO_STRICTNESS_OPTIONS[self._video_strict_combo.currentIndex()]
         else:
@@ -280,7 +339,7 @@ class SimilarityPage(QWidget):
         self._stack.setCurrentWidget(self._scanning_page)
 
         self._thread = QThread(self)
-        self._worker = SimilarityWorker(targets, mode, threshold, min_match_seconds)
+        self._worker = SimilarityWorker(targets, mode, threshold, min_match_seconds, group_b=group_b)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._thread.quit)

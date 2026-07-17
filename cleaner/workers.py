@@ -246,12 +246,20 @@ class SimilarityWorker(QObject):
     finished = pyqtSignal(list)                 # list[dict]:{"paths","segments","kind"}
     error = pyqtSignal(str)
 
-    def __init__(self, targets: list[str], mode: str, threshold: int, min_match_seconds: int):
+    def __init__(
+        self,
+        targets: list[str],
+        mode: str,
+        threshold: int,
+        min_match_seconds: int,
+        group_b: list[str] | None = None,
+    ):
         super().__init__()
         self._targets = targets
         self._mode = mode                                 # "image" | "video"
         self._threshold = threshold                       # Hamming 門檻:圖片是兩張圖整體比對,影片是逐幀比對
         self._min_match_seconds = min_match_seconds       # 影片專用:最短相似片段(秒)
+        self._group_b = group_b                           # 影片專用「資料夾對資料夾」模式:群組 B(見 similarity.find_similar_videos)
         self._cancelled = False
 
     def cancel(self):
@@ -280,6 +288,7 @@ class SimilarityWorker(QObject):
                     frame_threshold=self._threshold,
                     progress_cb=emit,
                     cancel_check=cancel,
+                    group_b=self._group_b,
                 )
                 result = [{"paths": d["paths"], "segments": d["segments"], "kind": "video"} for d in raw]
             else:

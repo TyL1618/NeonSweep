@@ -73,6 +73,10 @@ class NeonChip(QPushButton):
             QPushButton:hover {{
                 border: 1px solid {theme.NEON_PINK_L};
             }}
+            QPushButton:disabled {{
+                border: 1px dashed {theme.BG_HOVER};
+                color: {theme.BG_HOVER};
+            }}
         """)
 
 
