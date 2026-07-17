@@ -45,11 +45,16 @@ a = Analysis(
         'cleaner.analysis',
         'cleaner.treemap',
         'cleaner.similarity',
+        # 相似影片指紋快取。SimilarityWorker.run() 延遲 import(跟 cleaner.similarity 同樣模式),
+        # PyInstaller 靜態分析看不到,必須明確列出,否則凍結後相似影片掃描會 crash。
+        'cleaner.print_cache',
         'cleaner.diagnostics',
         'cleaner.smart_health',
         'cleaner.utils',
         'cleaner.utils.fs',
         'cleaner.utils.admin',
+        # 掃描期間降程序優先權(SimilarityWorker.run() 延遲 import),同樣要明確列出。
+        'cleaner.utils.proc',
         'cleaner.modules',
         'cleaner.modules.base',
         'cleaner.modules.user_temp',
