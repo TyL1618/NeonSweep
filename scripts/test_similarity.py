@@ -189,7 +189,48 @@ def test_long_video_coverage(tmp: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# 測試 6:指紋快取(Stage 1 起;未實作時自動略過)
+# 測試 6:精修窗收窄(階段 2 最大的成本來源,回歸防護)
+# ----------------------------------------------------------------------
+
+
+def test_refine_window_bounded(tmp: str) -> None:
+    """兩部長片只共用一小段(短於 min_match_seconds,不算重複),但足以在粗篩湊到 >=2 票
+    而觸發精修——真實影片庫裡最常見的誤觸發樣態(共用片頭、相似轉場)。
+
+    精修的取樣次數必須跟「證據範圍」成正比,而不是跟「幾何重疊」成正比。收窄前這裡會對
+    兩邊各取樣 400 次(共 800 次 seek,HDD 上 ~9.6 秒);收窄後只需要 ~116 次。
+    這個上限守不住的話,大型影片庫的掃描時間會回到「一整天」的等級。
+    """
+    d = os.path.join(tmp, "refine")
+    os.makedirs(d)
+    shared = content_frames(seed=999, seconds=8)          # 只共用 8 秒 < min_match_seconds
+    write_video(os.path.join(d, "A.mp4"), content_frames(1, 196) + shared + content_frames(2, 196))
+    write_video(os.path.join(d, "B.mp4"), content_frames(3, 196) + shared + content_frames(4, 196))
+
+    orig = sim._sample_window
+    counted = {"samples": 0}
+
+    def counting(path, start, end, interval, max_samples=None, cancel_check=None):
+        out = orig(path, start, end, interval, max_samples, cancel_check)
+        counted["samples"] += len(out)
+        return out
+
+    sim._sample_window = counting
+    try:
+        groups = group_names(sim.find_similar_videos([d], min_match_seconds=20))
+    finally:
+        sim._sample_window = orig
+
+    check("精修:只共用 8 秒的長片不該被判為重複", groups == [], f"實際={groups}")
+    check(
+        "精修:候選窗收窄到證據範圍(取樣數 << 幾何重疊)",
+        counted["samples"] < 300,
+        f"取樣 {counted['samples']} 次(收窄前為 800;超過 300 代表收窄失效)",
+    )
+
+
+# ----------------------------------------------------------------------
+# 測試 7:指紋快取(Stage 1 起;未實作時自動略過)
 # ----------------------------------------------------------------------
 
 
@@ -272,7 +313,9 @@ def main() -> int:
         test_reencode(tmp)
         print("[5] 長片涵蓋")
         test_long_video_coverage(tmp)
-        print("[6] 指紋快取")
+        print("[6] 精修窗收窄")
+        test_refine_window_bounded(tmp)
+        print("[7] 指紋快取")
         test_cache(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

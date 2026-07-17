@@ -242,18 +242,27 @@ def _estimate_offset(va: dict, vb: dict, frame_threshold: int):
     取樣起點跟長片的粗篩取樣起點通常對不上相位(兩者都是各自從 t=0 開始,而真正重疊的位移
     量是未知數,不會剛好是間隔的整數倍),硬併只會讓兩邊的取樣點集合幾乎不重疊、比對失敗。
     改成不管相位、直接抓「哪一對樣本內容相近」,再用位移投票找出最可能的重疊位置,不受兩邊
-    間隔/相位不同影響。回傳 (offset_seconds, votes) 或 (None, 0)。
+    間隔/相位不同影響。
+
+    回傳 (offset_seconds, votes, hit_span) 或 (None, 0, None)。`hit_span` 是「投給勝出位移的
+    那些樣本」在 A 時間軸上的 (最早, 最晚) 時間——也就是**證據實際落在哪個範圍**。精修只需要
+    看這個範圍,不必掃整個幾何重疊(見 find_similar_videos 呼叫處的說明,這是階段 2 最大的
+    成本來源)。
     """
     match = _match_matrix(va["hashes"], vb["hashes"], frame_threshold, va["degenerate"], vb["degenerate"])
     if not match.any():
-        return None, 0
+        return None, 0, None
     ia, ib = np.nonzero(match)
-    offsets = ia.astype(np.float64) * va["interval"] - ib.astype(np.float64) * vb["interval"]
+    # 用真實時間戳而不是「索引 × 間隔」:等距取樣時兩者相同,但非等距取樣的後端(見
+    # BACKEND_UNIFORM 說明)只有 times 是對的,這樣位移計算不必分兩套邏輯。
+    ta = va["times"][ia]
+    offsets = ta - vb["times"][ib]
     bucket = max(va["interval"], vb["interval"])
     buckets = np.round(offsets / bucket).astype(np.int64)
     values, counts = np.unique(buckets, return_counts=True)
     best_idx = int(np.argmax(counts))
-    return float(values[best_idx]) * bucket, int(counts[best_idx])
+    hits = ta[buckets == values[best_idx]]
+    return float(values[best_idx]) * bucket, int(counts[best_idx]), (float(hits.min()), float(hits.max()))
 
 
 # ----------------------------------------------------------------------
@@ -744,12 +753,29 @@ def find_similar_videos(
             else:
                 # 至少一邊牽涉到長片(間隔被放寬過):兩邊取樣的相位不保證對齊,改用位移投票
                 # 找出候選重疊窗,再把 B 的全長投影到 A 的時間軸上,只在那個窗附近精修。
-                offset, votes = _estimate_offset(va, vb, frame_threshold)
+                offset, votes, hit_span = _estimate_offset(va, vb, frame_threshold)
                 if offset is None or votes < 2:
                     pruned_pairs += 1
                     continue
                 ta0 = max(0.0, offset)
                 ta1 = min(va["duration"], offset + vb["duration"])
+                if ta1 - ta0 < min_match_seconds:
+                    pruned_pairs += 1
+                    continue
+                # 把候選窗從「幾何重疊」收窄到「投票證據實際落在的範圍」。這是階段 2 最大的
+                # 成本來源:兩部 30 分鐘影片在 offset≈0 時,幾何重疊 = 整整 1800 秒,精修會對
+                # 兩邊各取樣 VIDEO_REFINE_MAX_SAMPLES(600)次 = 1200 次 seek,傳統硬碟上光是
+                # 磁頭移動就要 ~14 秒——而絕大多數會走到這裡的配對其實只是 2 票的巧合,根本不
+                # 相似。收窄後,巧合配對的窗只有幾十秒(取樣數跟著掉一個數量級),真正的重疊
+                # 則因為投票樣本本來就散佈在整段重疊上,窗幾乎不變、精度不受影響。
+                #
+                # 為什麼不會漏抓:真的有 T 秒重疊時,粗篩會在整段 T 上取到 ~T/bucket 個樣本、
+                # 全部投給同一個位移,所以 hit_span 本來就涵蓋整段重疊。再往外墊
+                # min_match_seconds,讓「重疊比證據稍微長一點」的邊緣情況也有餘裕。
+                lo, hi = hit_span
+                pad = min_match_seconds + max(va["interval"], vb["interval"])
+                ta0 = max(ta0, lo - pad)
+                ta1 = min(ta1, hi + pad)
                 if ta1 - ta0 < min_match_seconds:
                     pruned_pairs += 1
                     continue
