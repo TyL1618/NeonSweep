@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # 都看不到,這裡只是降低開發時終端機的雜訊。
 cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
 
+# OpenCV 自己的 parallel_for 執行緒池:這個模組餵給 cv2 的影像都極小(resize 到 9x8、
+# cvtColor 一張畫面),平行化拿不到任何好處,只會多開一堆執行緒跟 ffmpeg 的解碼執行緒搶核心。
+# 關掉可以少一個 CPU 壓力來源(真正的大頭是 ffmpeg 解碼,那個要靠降低程序優先權處理,
+# 見 utils/proc.py)。
+cv2.setNumThreads(1)
+
 # 影片取樣參數
 VIDEO_INTERVAL_SEC = 1.0     # 每幾秒取一幀
 VIDEO_MAX_SAMPLES = 300      # 單片最多取樣幀數(上限,避免超長片把 DP 撐爆)
@@ -42,7 +48,19 @@ VIDEO_REFINE_MAX_SAMPLES = 600  # 精修階段單邊取樣上限:候選窗可能
                                 # 時窗長≈整片),必須跟粗篩一樣有上限,否則解碼次數與 Smith-Waterman
                                 # 的 O(na*nb) DP 會隨窗長無上限膨脹(見 _refine_match)
 VIDEO_FRAME_THRESHOLD = 10   # 兩幀 dHash 視為「相同畫面」的 Hamming 上限
-VIDEO_FINGERPRINT_WORKERS = 4  # 平行算指紋的執行緒數,偏保守——傳統硬碟上開太多平行 seek 反而互相拖累
+
+# 平行算指紋的執行緒數,偏保守——傳統硬碟上開太多平行 seek 反而互相拖累。
+# 4 是沒有實測數據下的猜測(見 DEVDOC §8.6);HDD 的最佳值跟磁碟、影片大小、檔案碎片化都有關,
+# 只能在真實影片庫上量。用環境變數覆寫,方便在目標機器上 A/B 找出甜蜜點,不必改程式重打包:
+#     set NEONSWEEP_FP_WORKERS=2 && NeonSweep.exe
+# 每次掃描的耗時會寫進 log(見 find_similar_videos),直接比對就知道哪個值好。
+VIDEO_FINGERPRINT_WORKERS = 4
+try:
+    _env_workers = int(os.environ.get("NEONSWEEP_FP_WORKERS", ""))
+    if 1 <= _env_workers <= 32:
+        VIDEO_FINGERPRINT_WORKERS = _env_workers
+except ValueError:
+    pass
 
 # 圖片退化指紋門檻:純色圖 dHash 全為 0、平滑漸層圖可能全為 1,這類圖的 dHash 幾乎沒有鑑別力
 # (純黑圖彼此距離恆為 0),會製造大量假群組。popcount(1 的個數)落在 [DEGENERATE, 64-DEGENERATE]
@@ -660,12 +678,15 @@ def find_similar_videos(
         st = cache.stats()
         cache_note = f" | 快取命中 {st['hits']}、未命中 {st['misses']}"
     logger.info(
-        "階段 1(指紋)完成:%.1f 秒 | 影片檔 %d 個 → 可用指紋 %d 份(%d 個解不開或太短)%s",
+        "階段 1(指紋)完成:%.1f 秒 | 影片檔 %d 個 → 可用指紋 %d 份(%d 個解不開或太短)%s"
+        " | 解碼 %d 執行緒(NEONSWEEP_FP_WORKERS 可調)、需解碼 %d 部",
         phase1_sec,
         total,
         len(videos),
         total - len(videos),
         cache_note,
+        fingerprint_workers,
+        len(miss_paths),
     )
 
     n = len(videos)

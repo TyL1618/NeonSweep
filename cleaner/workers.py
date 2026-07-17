@@ -277,8 +277,26 @@ class SimilarityWorker(QObject):
             self.finished.emit([])
             return
 
+        from .utils.proc import BackgroundPriority
+
         emit = lambda phase, done, total, path: self.progress.emit(phase, done, total, path)
         cancel = lambda: self._cancelled
+        result = []
+        cache = None
+        # 掃描期間把程序降到 below-normal:解碼會吃滿所有核心,不讓路的話使用者連滑鼠都在卡
+        # (見 utils/proc.py 說明)。context manager 保證不管例外或取消都會還原。
+        try:
+            with BackgroundPriority():
+                result = self._scan(similarity, emit, cancel)
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(f"相似偵測發生未預期錯誤:{e}")
+        finally:
+            self.finished.emit(result)
+
+    def _scan(self, similarity, emit, cancel) -> list:
+        """實際掃描。例外往上丟給 run() 統一處理——finished 只能由 run() 的 finally 發一次
+        (§10.1:finished 沒發或發兩次都會讓 QThread 收尾出問題)。"""
         result = []
         cache = None
         try:
@@ -308,13 +326,10 @@ class SimilarityWorker(QObject):
                     self._targets, threshold=self._threshold, progress_cb=emit, cancel_check=cancel
                 )
                 result = [{"paths": g, "segments": [], "kind": "image"} for g in raw]
-        except Exception as e:
-            traceback.print_exc()
-            self.error.emit(f"相似偵測發生未預期錯誤:{e}")
         finally:
             if cache is not None:
                 cache.close()
-            self.finished.emit(result)
+        return result
 
 
 class DiagnosticWorker(QObject):

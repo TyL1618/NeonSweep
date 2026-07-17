@@ -230,7 +230,36 @@ def test_refine_window_bounded(tmp: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# 測試 7:指紋快取(Stage 1 起;未實作時自動略過)
+# 測試 7:掃描期間的程序優先權
+# ----------------------------------------------------------------------
+
+
+def test_background_priority() -> None:
+    """降優先權失敗是**無聲**的(ctypes 不會丟例外,只是什麼都沒發生),所以要真的去讀回來確認。
+
+    踩過的雷:沒宣告 restype 時,GetCurrentProcess() 的 64 位元 pseudo-handle 會被截成 32 位元,
+    SetPriorityClass 收到無效 handle 直接失敗——掃描照跑、使用者照卡,但沒有任何錯誤訊息。
+    """
+    from cleaner.utils.proc import (
+        BELOW_NORMAL_PRIORITY_CLASS,
+        NORMAL_PRIORITY_CLASS,
+        BackgroundPriority,
+        current_priority_class,
+    )
+
+    before = current_priority_class()
+    with BackgroundPriority():
+        inside = current_priority_class()
+    after = current_priority_class()
+
+    check("優先權:區間內確實降到 below-normal", inside == BELOW_NORMAL_PRIORITY_CLASS,
+          f"區間內={hex(inside)},應為 {hex(BELOW_NORMAL_PRIORITY_CLASS)}(0 代表 API 呼叫失敗)")
+    check("優先權:離開區間後還原成 normal", after == NORMAL_PRIORITY_CLASS,
+          f"離開後={hex(after)}(進入前={hex(before)})")
+
+
+# ----------------------------------------------------------------------
+# 測試 8:指紋快取(Stage 1 起;未實作時自動略過)
 # ----------------------------------------------------------------------
 
 
@@ -315,7 +344,9 @@ def main() -> int:
         test_long_video_coverage(tmp)
         print("[6] 精修窗收窄")
         test_refine_window_bounded(tmp)
-        print("[7] 指紋快取")
+        print("[7] 程序優先權")
+        test_background_priority()
+        print("[8] 指紋快取")
         test_cache(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
