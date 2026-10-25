@@ -126,6 +126,30 @@ def test_cross_overlap_dedup(tmp: str) -> None:
     check("cross 模式:重疊資料夾不產生自我配對假重複", groups == [], f"實際={groups}")
 
 
+def test_cross_nested_compares_against_rest(tmp: str) -> None:
+    """實務常見用法:A=母資料夾、B=母資料夾裡的子資料夾,想比「子資料夾 vs 其餘部分」。
+    子資料夾的路徑一定比母資料夾長(較具體),應該優先歸類進 B;母資料夾掃到重疊路徑時
+    再略過,讓 A 組自動只剩「母資料夾扣掉子資料夾」的部分——而不是子資料夾整批被母資料夾
+    先認領走,導致 B 組是空的、估計配對數是 0、什麼都比不出來(真實案例:使用者拿母資料夾
+    跟裡面的子資料夾比對,兩小時的指紋運算後階段 2 比對 0 對)。
+    """
+    root = os.path.join(tmp, "nested")
+    sub = os.path.join(root, "sub")
+    os.makedirs(sub)
+    shared = content_frames(seed=606, seconds=25)
+    unrelated = content_frames(seed=707, seconds=25)
+    write_video(os.path.join(root, "Outside.mp4"), shared)      # 母資料夾、子資料夾之外
+    write_video(os.path.join(sub, "Inside.mp4"), shared)        # 子資料夾內,跟 Outside 同內容
+    write_video(os.path.join(sub, "Unique.mp4"), unrelated)     # 子資料夾內,沒有對應
+
+    cross = group_names(sim.find_similar_videos([root], min_match_seconds=10, group_b=[sub]))
+    check(
+        "cross 模式:母資料夾 vs 子資料夾,母資料夾自動排除子資料夾內容、正確比出跨組配對",
+        cross == [["Inside.mp4", "Outside.mp4"]],
+        f"實際={cross}",
+    )
+
+
 # ----------------------------------------------------------------------
 # 測試 3:剪枝不變量(數學保證無假陰性)
 # ----------------------------------------------------------------------
@@ -472,6 +496,7 @@ def main() -> int:
         print("[2] 資料夾對資料夾模式")
         test_cross_mode(tmp)
         test_cross_overlap_dedup(tmp)
+        test_cross_nested_compares_against_rest(tmp)
         print("[3] 剪枝不變量")
         test_pruning_invariant()
         print("[4] 重編碼")

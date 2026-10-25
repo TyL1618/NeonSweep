@@ -47,6 +47,12 @@ VIDEO_MAX_SAMPLES = 300      # 單片最多取樣幀數(上限,避免超長片�
 VIDEO_REFINE_MAX_SAMPLES = 600  # 精修階段單邊取樣上限:候選窗可能很長(兩部都是長片、offset≈0
                                 # 時窗長≈整片),必須跟粗篩一樣有上限,否則解碼次數與 Smith-Waterman
                                 # 的 O(na*nb) DP 會隨窗長無上限膨脹(見 _refine_match)
+VIDEO_REFINE_QUICK_MAX_SAMPLES = 96  # 精修「粗檢」的單邊取樣上限。粗檢的職責是廉價否決,不是
+                                     # 精確定位——候選窗被散落的巧合票撐得很寬時(2026-07-18 實測
+                                     # 的主要成本樣態),若沒有自己的上限,粗檢本身就要取
+                                     # 600/4=150 個樣本,「廉價」否決一點都不廉價。真配對不受
+                                     # 影響:間隔再粗,重疊段內的樣本一樣對得上,湊 matched_sec
+                                     # 門檻綽綽有餘。
 VIDEO_FRAME_THRESHOLD = 10   # 兩幀 dHash 視為「相同畫面」的 Hamming 上限
 
 # 階段 2 每隔幾秒寫一行進度到 log。大型影片庫的階段 2 要跑數小時,只在結束時記錄的話,
@@ -308,9 +314,20 @@ def _estimate_offset(va: dict, vb: dict, frame_threshold: int):
     bucket = max(va["interval"], vb["interval"])
     buckets = np.round(offsets / bucket).astype(np.int64)
     values, counts = np.unique(buckets, return_counts=True)
-    best_idx = int(np.argmax(counts))
-    hits = ta[buckets == values[best_idx]]
-    return float(values[best_idx]) * bucket, int(counts[best_idx]), (float(hits.min()), float(hits.max()))
+    # 相鄰桶合票:真正的位移落在桶界附近時,同一段重疊的證據會被 round 拆進兩個相鄰桶,
+    # 單桶票數直接腰斬——呼叫端的票數門檻若按單桶票數把關,真配對會在桶界運氣不好時被
+    # 誤殺。改成每個桶連同左右鄰桶一起計票再選勝者,證據不因桶界切割被低估,門檻才能
+    # 安全地隨證據量提高(見呼叫端 required_votes)。
+    merged = counts.astype(np.int64).copy()
+    adj = values[1:] == values[:-1] + 1
+    merged[:-1] += np.where(adj, counts[1:], 0)
+    merged[1:] += np.where(adj, counts[:-1], 0)
+    best_idx = int(np.argmax(merged))
+    sel = np.abs(buckets - values[best_idx]) <= 1
+    hits = ta[sel]
+    # 位移取勝出視窗內所有配對的平均,而不是桶中心——桶寬可以是好幾秒(長片間隔),量化到
+    # 桶中心的誤差會吃掉精修窗的 margin。
+    return float(offsets[sel].mean()), int(merged[best_idx]), (float(hits.min()), float(hits.max()))
 
 
 # ----------------------------------------------------------------------
@@ -531,6 +548,7 @@ def _refine_match(
     frame_threshold: int,
     base_interval: float = VIDEO_INTERVAL_SEC,
     cancel_check=None,
+    min_match_seconds: float = 0.0,
 ):
     """精修階段:粗篩只給了「大概哪一段對得上」的候選時間窗(可能因為粗篩間隔較粗而不準)。
     這裡只針對候選窗附近(留一點 margin 免得邊界剛好切到)重新密集取樣,重新跑一次
@@ -549,6 +567,26 @@ def _refine_match(
 
     span = max(a_end - a_start, b_end - b_start)
     interval = max(base_interval, span / VIDEO_REFINE_MAX_SAMPLES)
+
+    # 廉價否決(粗檢):實測(2026-07-17,真實影片庫 cross 模式)位移投票放進精修的候選
+    # >99% 是巧合誤報,而精修是階段 2 唯一要重新開檔解碼的步驟——直接付全精度取樣
+    # (兩邊各上百次 seek,HDD 上 ~2.4 秒/次)太浪費。先用 4 倍粗的間隔取 1/4 的樣本跑
+    # 同一套對齊:真配對的逐幀匹配率跟取樣密度無關,粗間隔下一樣對得上;巧合誤報則湊不出
+    # 足夠的 matched_sec,只花 1/4 成本就出局。門檻取 min_match_seconds 的一半——全額門檻
+    # 由下面的細檢與呼叫端把關,粗檢只砍「連一半都湊不到」的明顯誤報,粗取樣的統計雜訊
+    # 不會誤殺真配對。min_match_seconds <= 0 時跳過粗檢(行為同改動前,測試直接呼叫時適用)。
+    if min_match_seconds > 0:
+        coarse_interval = max(interval * 4, span / VIDEO_REFINE_QUICK_MAX_SAMPLES)
+        coarse_a = _sample_window(path_a, a_start, a_end, coarse_interval, VIDEO_REFINE_QUICK_MAX_SAMPLES, cancel_check)
+        coarse_b = _sample_window(path_b, b_start, b_end, coarse_interval, VIDEO_REFINE_QUICK_MAX_SAMPLES, cancel_check)
+        if len(coarse_a) < 2 or len(coarse_b) < 2:
+            return None
+        ca = np.array(coarse_a, dtype=np.uint64)
+        cb = np.array(coarse_b, dtype=np.uint64)
+        coarse_match = _match_matrix(ca, cb, frame_threshold, _degenerate_mask(ca), _degenerate_mask(cb))
+        _cb_, _a0, _a1, _b0, _b1, coarse_count = _local_align(coarse_match.tolist(), len(coarse_a), len(coarse_b))
+        if coarse_count * coarse_interval < 0.5 * min_match_seconds:
+            return None
 
     hash_a = _sample_window(path_a, a_start, a_end, interval, VIDEO_REFINE_MAX_SAMPLES, cancel_check)
     hash_b = _sample_window(path_b, b_start, b_end, interval, VIDEO_REFINE_MAX_SAMPLES, cancel_check)
@@ -618,25 +656,26 @@ def find_similar_videos(
 
     # 階段 1a:先蒐集所有影片路徑(快,不必平行化),這樣才能事先知道總數給進度條用。
     # group_b 模式下,path_group 記錄每個路徑屬於 A 或 B;若兩組資料夾有重疊/巢狀(同一個檔案
-    # 兩邊都掃得到),以先蒐集到的 A 為準、B 端跳過,避免同一部影片被重複算指紋、跟自己比對出
-    # 一組假重複。
+    # 兩邊都掃得到)——最常見的情況是使用者選了「母資料夾」當一組、裡面的「子資料夾」當另一
+    # 組(想比較「子資料夾 vs 其餘部分」)——路徑較長、較具體的根目錄代表使用者選的是比較窄的
+    # 子集,應該優先認領自己範圍內的檔案;路徑較淺的根目錄掃到重疊路徑時再略過。這樣母資料夾
+    # 那組會自動排除掉子資料夾的內容、只剩「其餘部分」,符合語意。若照掃描順序(A 永遠先贏)
+    # 來決定歸屬,子資料夾整批路徑會被母資料夾那次掃描先認領走,子資料夾那組變空、比對階段
+    # 估計出 0 對候選,兩小時的指紋運算全部白跑。
+    labeled_roots = [(root, "A") for root in targets]
+    if group_b is not None:
+        labeled_roots += [(root, "B") for root in group_b]
+    labeled_roots.sort(key=lambda rg: len(os.path.normcase(os.path.abspath(rg[0]))), reverse=True)
+
     paths = []
     path_group: dict[str, str] = {}
-    for root in targets:
+    for root, group in labeled_roots:
         for entry in safe_walk(root, exclude_dirs=EXCLUDED_DIRS):
             if cancelled():
                 return []
             if os.path.splitext(entry.path)[1].lower() in VIDEO_EXTS and entry.path not in path_group:
-                path_group[entry.path] = "A"
+                path_group[entry.path] = group
                 paths.append(entry.path)
-    if group_b is not None:
-        for root in group_b:
-            for entry in safe_walk(root, exclude_dirs=EXCLUDED_DIRS):
-                if cancelled():
-                    return []
-                if os.path.splitext(entry.path)[1].lower() in VIDEO_EXTS and entry.path not in path_group:
-                    path_group[entry.path] = "B"
-                    paths.append(entry.path)
 
     videos = []  # list[dict]:指紋(順序不保證跟 paths 一致,分群不受影響)
     total = len(paths)
@@ -778,6 +817,7 @@ def find_similar_videos(
     t_phase2 = time.monotonic()
     dp_calls = 0
     refine_calls = 0
+    refine_hits = 0   # 精修後真的通過門檻的次數:跟 refine_calls 的比值反映粗篩漏了多少假候選
     pruned_pairs = 0
     pair_cache_hits = 0
     last_log = time.monotonic()
@@ -788,7 +828,7 @@ def find_similar_videos(
         segments——那些留給呼叫端(見下方 for j 迴圈),讓「怎麼判定」跟「命中配對結論快取時
         要不要重新判定」共用同一個函式,不必在快取命中/未命中兩條路上各寫一份。
         """
-        nonlocal dp_calls, refine_calls, pruned_pairs
+        nonlocal dp_calls, refine_calls, refine_hits, pruned_pairs
 
         if va["hashes"].shape == vb["hashes"].shape and np.array_equal(va["hashes"], vb["hashes"]):
             # 指紋陣列逐 bit 相同:內容完全一致(常見於同一部影片重複下載、只是容器/編碼
@@ -822,7 +862,30 @@ def find_similar_videos(
         # 至少一邊牽涉到長片(間隔被放寬過):兩邊取樣的相位不保證對齊,改用位移投票找出候選
         # 重疊窗,再把 B 的全長投影到 A 的時間軸上,只在那個窗附近精修。
         offset, votes, hit_span = _estimate_offset(va, vb, frame_threshold)
-        if offset is None or votes < 2:
+        # 票數門檻隨證據量調整(舊版固定 >= 2 票)。最終要過精修的 matched_sec >=
+        # min_match_seconds,那段真重疊在粗篩指紋上「對得上的取樣對」個數就該有
+        # min_match_seconds / bucket 的量級(bucket 是兩邊較粗的間隔,粗的那邊決定證據密度);
+        # 取 0.5 倍當安全係數(粗取樣的相位與雜訊會吃掉一部分票,_estimate_offset 已做相鄰桶
+        # 合票避免桶界切割)。至少 2 票的底線保留——長片對長片時 bucket 可能大於
+        # min_match_seconds,一段真重疊本來就只湊得出一兩票。實測(2026-07-17,850 部影片
+        # cross 模式)固定 2 票會讓 ~2% 的配對漏進精修、其中 >99% 白跑,每次精修要重開兩部
+        # 影片 + 上百次 seek(HDD 上 ~2.4 秒),階段 2 從此以小時計;門檻隨證據量走之後,
+        # 巧合湊出兩三票的假候選在這裡就出局,真配對的票數遠高於門檻、不受影響。
+        bucket = max(va["interval"], vb["interval"])
+        required_votes = max(2, math.ceil(0.5 * min_match_seconds / bucket))
+        if offset is None or votes < required_votes:
+            pruned_pairs += 1
+            return False, None
+        # 票數密度門檻(2026-07-18 實測補上):長片對長片時 bucket 可能大於 min_match_seconds,
+        # 上面的門檻退回 2 票底線——但巧合湊出來的 2 票通常散落在相距數百秒的兩處,證據範圍
+        # (hit_span)被撐得極寬,精修窗跟著變大,單次精修從 ~1 秒膨脹到數秒;而真配對的票
+        # 會密集鋪滿整段重疊(重疊 L 秒就該有 ~L/bucket 量級的票)。要求票數至少是證據範圍
+        # 長度的 0.2 倍密度(0.2 = 容忍真配對只有兩成取樣幀對得上的保守值;比這更稀的配對
+        # 就算進了精修,matched_sec 也湊不到門檻,擋掉不損失任何最終會成立的組)。範圍短於
+        # min_match_seconds 時不加碼(密度在小樣本下沒有統計意義,交給既有門檻與精修粗檢)。
+        lo, hi = hit_span
+        span_len = hi - lo
+        if span_len > min_match_seconds and votes < math.ceil(0.2 * span_len / bucket):
             pruned_pairs += 1
             return False, None
         ta0 = max(0.0, offset)
@@ -831,8 +894,7 @@ def find_similar_videos(
             pruned_pairs += 1
             return False, None
         # 把候選窗從「幾何重疊」收窄到「投票證據實際落在的範圍」(階段 2 最大的成本來源,
-        # 見 DEVDOC §8.6 的 _refine_match 說明)。
-        lo, hi = hit_span
+        # 見 DEVDOC §8.6 的 _refine_match 說明)。lo/hi 在上面的密度門檻已解包。
         pad = min_match_seconds + max(va["interval"], vb["interval"])
         ta0 = max(ta0, lo - pad)
         ta1 = min(ta1, hi + pad)
@@ -842,13 +904,15 @@ def find_similar_videos(
         tb0, tb1 = ta0 - offset, ta1 - offset
         refine_calls += 1
         refined = _refine_match(
-            va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval, cancel_check
+            va["path"], vb["path"], ta0, ta1, tb0, tb1, frame_threshold, base_interval, cancel_check,
+            min_match_seconds,
         )
         if refined is None:
             return False, None
         fa0, fa1, fb0, fb1, matched_sec = refined
         if matched_sec < min_match_seconds:
             return False, None
+        refine_hits += 1
         return True, (fa0, fa1, fb0, fb1)
 
     def _phase2_line(tag: str) -> str:
@@ -859,7 +923,7 @@ def find_similar_videos(
             f"階段 2({tag}):{el / 60:.1f} 分鐘 | 已比對 {done_pairs}/{total_pairs_estimate} 對"
             f"({100 * done_pairs / max(total_pairs_estimate, 1):.1f}%,{rate:.0f} 對/秒,推估剩 {left:.0f} 分鐘)"
             f" | 配對快取命中 {pair_cache_hits}、剪枝擋掉 {pruned_pairs}、進 DP {dp_calls} 次、"
-            f"進精修 {refine_calls} 次 | 目前 {len(result)} 組"
+            f"進精修 {refine_calls} 次(通過 {refine_hits})| 目前 {len(result)} 組"
         )
 
     for i in range(n):
@@ -943,7 +1007,7 @@ def find_similar_videos(
     phase2_sec = time.monotonic() - t_phase2
     logger.info(
         "階段 2(比對)完成:%.1f 秒 | 影片 %d 部、實際比對 %d 對(估計上限 %d)| "
-        "配對快取命中 %d、便宜剪枝擋掉 %d 對、進 DP %d 次、進精修 %d 次 | 產出 %d 組",
+        "配對快取命中 %d、便宜剪枝擋掉 %d 對、進 DP %d 次、進精修 %d 次(通過 %d)| 產出 %d 組",
         phase2_sec,
         n,
         done_pairs,
@@ -952,6 +1016,7 @@ def find_similar_videos(
         pruned_pairs,
         dp_calls,
         refine_calls,
+        refine_hits,
         len(result),
     )
     logger.info("相似影片掃描總計:%.1f 秒(階段 1:%.1f 秒、階段 2:%.1f 秒)", phase1_sec + phase2_sec, phase1_sec, phase2_sec)
