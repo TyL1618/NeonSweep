@@ -1,5 +1,14 @@
-PyQt6>=6.5.0
-send2trash>=1.8.2
+# 版本全部用 == 釘死：bat（build_exe.bat -> setup_env.bat）會建 .venv 並照這份安裝，
+# 讓任何電腦打出來的 exe 用的是同一組套件。版本是 2026-10 在 Python 3.14 實際打包驗證過的組合；
+# 要升級：改版本號 -> 跑測試 -> 重新打包 -> 實際開起來確認 -> 才提交。
+
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.0  # PyQt6 的底層套件：不釘的話 pip 會自動抓最新版，各電腦就不一致
+PyQt6-sip==13.11.1
+send2trash==2.1.0
 # 相似圖片/影片偵測(相似檔案頁面)用:影片解碼取樣 + 感知雜湊。numpy 為其相依,會一併安裝。
 # 注意:打包時 NeonSweep.spec 的 excludes 需移除 numpy,否則相似偵測在 frozen exe 內會壞掉。
-opencv-python>=4.8
+opencv-python==5.0.0.93
+numpy==2.4.4  # cleaner/print_cache.py
+pyinstaller==6.20.0  # 打包
+pillow==12.2.0  # scripts/gen_icon.py（開發期）

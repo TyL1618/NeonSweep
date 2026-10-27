@@ -1010,3 +1010,10 @@ onefile 打包的 exe,不管有沒有內嵌 smartctl.exe,本身就會因為要�
 - 這只能讓使用者知道「正在啟動、沒當掉」,不會讓啟動真的變快;如果延遲來源是防毒軟體
   攔截在「exe 連第一行程式碼都還沒被允許執行」的層級,連 Splash 都不會比它更早顯示。
   這種情況下沒有應用層級的解法,只能考慮日後幫 exe 做程式碼簽章。
+
+## 打包環境（build_exe.bat / setup_env.bat）
+`build_exe.bat` 開頭會呼叫 `setup_env.bat`：用 `py -3.14` 在專案資料夾建 `.venv`，照 `requirements.txt`（版本全部 `==` 釘死）安裝，再把 `.venv\Scripts` 放到 PATH 最前面，後面的 `python` / `pyinstaller` 都是 `.venv` 裡的那份。
+所以**換電腦 git clone 後直接雙擊 `build_exe.bat` 就能打包**，不依賴那台電腦原本裝了什麼版本的 Python 或套件。第一次要連網（約 1-3 分鐘），之後只有 `requirements.txt` 變動才會重新安裝。
+- 要換 Python 版本：改 `setup_env.bat` 的 `PYVER`、刪掉 `.venv` 後重跑。
+- 新增或升級套件：改 `requirements.txt`（用 `==`），下次執行 bat 會自動重裝；程式 import 了新套件卻沒寫進 `requirements.txt` 的話，別台電腦打包會缺模組。
+- `.venv/` 不進版控。

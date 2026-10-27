@@ -10,3 +10,6 @@ build/
 third_party/smartmontools/*.exe
 third_party/smartmontools/*.h
 third_party/smartmontools/LICENSE.txt
+
+# build_exe.bat creates this (isolated Python env, see setup_env.bat)
+.venv/

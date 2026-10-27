@@ -10,7 +10,7 @@ REM Same reason there is no nested if/else with a Chinese echo inside: use
 REM goto labels instead (same pattern as YungAnProject\M6000\build_exe.bat).
 REM
 REM What this does, in order:
-REM   1. check python and pyinstaller are on PATH
+REM   1. setup_env.bat: make sure .venv (pinned Python + requirements.txt) exists
 REM   2. delete the old dist\NeonSweep.exe
 REM   3. pyinstaller NeonSweep.spec --noconfirm --clean
 REM   4. verify the new exe actually exists
@@ -21,11 +21,8 @@ REM focus / switches the active window, which is annoying mid-work.
 setlocal
 cd /d "%~dp0"
 
-where python >nul 2>nul
-if errorlevel 1 goto :no_python
-
-where pyinstaller >nul 2>nul
-if errorlevel 1 goto :no_pyinstaller
+call "%~dp0setup_env.bat"
+if errorlevel 1 goto :end
 
 echo ============================================
 echo  清除舊的 dist\NeonSweep.exe...
@@ -53,20 +50,6 @@ if not exist "dist\NeonSweep.exe" goto :build_failed
 echo.
 echo ============================================
 echo  打包成功：dist\NeonSweep.exe
-echo ============================================
-goto :end
-
-:no_python
-echo.
-echo ============================================
-echo  找不到 python，請確認已安裝並加入 PATH（或先啟用 venv）。
-echo ============================================
-goto :end
-
-:no_pyinstaller
-echo.
-echo ============================================
-echo  找不到 pyinstaller，請先在這個 Python 環境執行： pip install pyinstaller
 echo ============================================
 goto :end
 
