@@ -26,7 +26,7 @@ python main.py
 ## 打包成 EXE
 
 ```bash
-pyinstaller NeonSweep.spec
+build_exe.bat   # 內部跑 pyinstaller NeonSweep.spec --noconfirm --clean
 # 輸出:dist\NeonSweep.exe
 ```
 

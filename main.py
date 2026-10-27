@@ -42,6 +42,9 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
+    if sys.platform == "win32":  # 工作列圖示：要在建立任何視窗前設定，否則會顯示 python.exe 的圖示
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yungan.neonsweep")
     QApplication.setStyle("Fusion")
     app = QApplication(sys.argv)
     app.setStyleSheet(GLOBAL_QSS)
