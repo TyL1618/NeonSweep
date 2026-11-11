@@ -793,6 +793,18 @@ def analyze(data: dict) -> dict:
              "要抓藍屏證據,需在解凍狀態下開啟傾印功能,並讓藍屏發生在解凍的那次開機"]))
         add("storage", 4.0, "還原軟體會在儲存堆疊掛過濾驅動,是儲存逾時的常見嫌疑")
         add("driver", 2.0, "還原軟體的核心驅動可能與其他驅動衝突")
+    # 快速啟動讓「關機」變成休眠:下次開機是恢復上次的核心狀態,不是完整開機。
+    # 還原軟體只在完整開機時才還原,所以使用者以為「每天關機=每天還原」,實際上可能根本沒還原過。
+    # 有些還原軟體(如 Deep Freeze)的官方文件也要求關閉快速啟動。這條是從朋友的真實案例推出來的。
+    fast_startup = data.get("crash_settings", {}).get("fast_startup")
+    if restore and fast_startup == 1:
+        findings.append(_finding(
+            "warn", "「快速啟動」是開啟的,按「關機」不會完整重開機",
+            "快速啟動會讓關機變成休眠,下次開機直接恢復上次狀態。還原軟體只在完整開機時才還原,"
+            "所以即使每天關機,保護空間與系統狀態也可能好幾天都沒被清掉。",
+            ["改用「重新啟動」而不是「關機」(重新啟動一定是完整開機)",
+             "或在解凍狀態下關閉快速啟動:控制台 → 電源選項 → 選擇電源按鈕的功能 → 取消勾選「啟用快速啟動」"]))
+        add("storage", 2.0, "快速啟動讓還原軟體很少真正還原,保護空間可能一直累積")
     if log_short:
         findings.append(_finding(
             "warn", f"事件記錄只回溯到 {span.get('oldest_local')}(約 {log_age:g} 天)",
@@ -1152,4 +1164,7 @@ def spec_rows(data: dict) -> list[tuple[str, str]]:
         put("電池", f"健康度約 {bat['full_mwh'] / bat['design_mwh'] * 100:.0f}%")
     if data.get("uptime_hours") is not None:
         put("已連續開機", f"{data['uptime_hours']:g} 小時")
+    fs = (data.get("crash_settings") or {}).get("fast_startup")
+    if fs is not None:
+        put("快速啟動", "開啟(按關機=休眠,不是完整重開機)" if fs == 1 else "關閉")
     return rows
