@@ -1011,6 +1011,93 @@ onefile 打包的 exe,不管有沒有內嵌 smartctl.exe,本身就會因為要�
   攔截在「exe 連第一行程式碼都還沒被允許執行」的層級,連 Splash 都不會比它更早顯示。
   這種情況下沒有應用層級的解法,只能考慮日後幫 exe 做程式碼簽章。
 
+## 14. 電腦體檢與藍屏診斷(給朋友用的遠端幫忙工具,使用者後續要求新增)
+
+**用途**:使用者常被朋友找去修電腦,每次都要問「幾 GB 記憶體、什麼 CPU、SSD 還是 HDD」,
+朋友自己也不知道。這個功能讓對方雙擊 exe → 按一顆「開始診斷」→ 把結果傳回來,開發者就能
+直接判斷。**全程唯讀,不修改系統任何設定,不刪除任何東西。**
+
+檔案:`cleaner/bugcheck_db.py`(停止代碼知識庫)、`cleaner/crash_analysis.py`(蒐集+推論,
+Qt-free)、`cleaner/crash_report.py`(輸出+個資遮蔽,Qt-free)、`cleaner/workers.py` 的
+`StabilityWorker`、`cleaner/views/stability_page.py`。
+
+### 14.1 蒐集項目(全是 Windows 內建工具,零新增依賴)
+
+| 項目 | 來源 |
+|---|---|
+| 機型/主機板/BIOS/OS/CPU/記憶體條/顯示卡/實體磁碟/電池 | PowerShell `Get-CimInstance`、`Get-PhysicalDisk`(輸出 JSON) |
+| 驅動版本(顯示/網路/儲存/音效/藍牙) | `Win32_PnPSignedDriver`(**慢,10 秒以上**,見 14.4) |
+| 藍屏紀錄(停止代碼+參數) | `wevtutil` 查 WER-SystemErrorReporting 事件 1001 |
+| 沒有藍屏的意外關機 | Kernel-Power 41 且 `BugcheckCode=0`(當機後長按電源鍵/斷電) |
+| 儲存錯誤 | disk 7/11/15/51/52/153、stornvme/storahci/iaStor 129、Ntfs 55/140 |
+| 硬體錯誤 | WHEA-Logger(**分 Level**,見 14.3) |
+| 顯示驅動重設 | Display 4101 |
+| 記憶體診斷結果 | MemoryDiagnostics-Results 1101/1102 |
+| 傾印檔 | 列出 `Minidump\*.dmp`,**直接讀 PAGEDU64 標頭**取停止代碼與參數(偏移 0x38/0x40),不需 WinDbg |
+| SMART | 沿用 `smart_health.py`(有 smartctl 才查) |
+
+事件一律用 `wevtutil /f:xml` 取結構化欄位、不比對任何中英文訊息文字,所以在任何語系的
+Windows 都能用。每個蒐集函式**絕不丟例外**:失敗的項目記進 `data["errors"]`,報告誠實標示
+「這項讀不到」,不假裝沒問題。
+
+### 14.2 推論(`analyze()`)
+
+規則簡單透明:每條規則對某個「原因方向」(儲存/驅動/記憶體/顯卡/硬體/電源)加分並記下理由,
+最後依分數排名。**不裝作精確機率**,目的是縮小範圍。整體燈號取所有發現中最嚴重的。
+結論為「沒有異常」時**不列推測方向**(否則等於在「正常」旁邊放警告)。
+
+### 14.3 用真機實測抓出的誤報(都已修,別改回去)
+
+1. **WHEA 事件 17(Level 3,PCIe 可修正錯誤)一台正常機器就有 100 筆**。只有 Level 1~2
+   才是「沒修正成功」的真錯誤;Level 3 只給 info。
+2. **磁碟 11 事件指向已不存在的磁碟編號** → 內建系統碟不會消失,判定為已拔除的外接碟,降為 info。
+3. **微軟內建驅動日期固定 2006-06-21**,不能拿來算「驅動過舊」;名稱以 `Standard` 開頭的也排除。
+4. 停止代碼知識庫查不到時給通用說明,不報錯。
+
+### 14.4 效能陷阱(實測)
+
+- **絕對不要設 `[Console]::OutputEncoding`**:stdout 是管線時這一行要 ~18 秒。改成在 PowerShell
+  端把 JSON 的非 ASCII 字元轉成 `\uXXXX`(`J` 函式),Python `json.loads` 自動還原。
+- `Win32_PnPSignedDriver` 本身要 13 秒且無法用 `-Filter` 加速(`Get-PnpDeviceProperty`
+  逐裝置查更慢,試過放棄)。所以**規格查詢與驅動查詢拆成兩次 PowerShell 並行**(`ThreadPoolExecutor`),
+  驅動在最後一步才取結果。整體從 26 秒降到 ~11 秒。
+
+### 14.5 輸出與個資(`crash_report.py`)
+
+- **複製摘要**:約 30 行純文字,貼 LINE/Messenger 用。
+- **匯出診斷包**(zip):`summary.txt`、`report.html`(自包含、深淺色皆可)、`data.json`、
+  `smart/*.txt`、可選 `dumps/*.dmp`(最近 3 個、單檔上限 200MB)。
+- **遮蔽在輸出前做一次遞迴取代**(`redact_data`),不靠各處記得別寫:使用者名稱、電腦名稱、
+  網域取自環境變數;事件欄位另遮 IPv4/MAC(驅動版本號長得像 IP,所以不套用到全部);
+  SMART 報告抹掉序號與 WWN;dump 路徑只留檔名。
+- **`.dmp` 無法遮蔽**(二進位、可能含記憶體片段),所以預設不附,使用者勾選並在確認對話框
+  看到明確警告才附。
+- 匯出前一律跳確認對話框,列出「會包含什麼」。
+
+### 14.6 給朋友用的「診斷模式」
+
+`main.py::_is_diag_mode()`:命令列帶 `--diag`,**或 exe 檔名含 `diag`**(不分大小寫)就只顯示
+診斷頁、隱藏側邊導覽。做法:把 `NeonSweep.exe` 複製一份改名 `NeonSweep-Diag.exe` 傳給朋友即可,
+同一份 build,不用教參數。非管理員時頁面頂端有黃色提示 + 一鍵「以系統管理員身分重新啟動」。
+
+### 14.7 刻意不做的項目
+
+- 不解析 dump 的模組清單去「點名驅動」(格式複雜,且需符號檔才準);改為附 dump 讓開發者用 WinDbg。
+- 不自動上傳(要架設與保管朋友資料、金鑰會被逆向取出、對方看不到傳了什麼);手動傳檔較讓人放心。
+- 不修復任何東西(不 chkdsk、不 sfc、不改設定),只提出建議。
+- 不碰 `Security` 事件記錄。
+
+### 14.8 已知限制
+
+- 未簽章的 exe 在別人電腦會跳 SmartScreen 警告(「其他資訊 → 仍要執行」)。
+- smartctl.exe 是 GPLv2,發給別人屬於再散布,需附上授權文字與原始碼連結。`NeonSweep.spec` 只會打包
+  **實際存在**的 `LICENSE.txt`,而 **2026-11-11 檢查時 `third_party/smartmontools/` 裡沒有這個檔案**
+  (只有 smartctl.exe 與 drivedb.h)——**正式發給朋友前要先補上**(從 smartmontools 官方壓縮包複製,見 §13.1),
+  並在分享時附上 <https://www.smartmontools.org> 連結。
+- 藍屏紀錄只回溯 90 天(`LOOKBACK_DAYS`);事件記錄被使用者清掉時,會用 dump 標頭補。
+- 這台開發機沒有真實藍屏可測,**停止代碼解析與 0x133 分支只用假造資料驗證過**;
+  真機第一次拿到藍屏紀錄時請核對 `wevtutil` 事件 1001 的欄位格式是否與預期相符。
+
 ## 打包環境（build_exe.bat / setup_env.bat）
 `build_exe.bat` 開頭會呼叫 `setup_env.bat`：用 `py -3.14` 在專案資料夾建 `.venv`，照 `requirements.txt`（版本全部 `==` 釘死）安裝，再把 `.venv\Scripts` 放到 PATH 最前面，後面的 `python` / `pyinstaller` 都是 `.venv` 裡的那份。
 所以**換電腦 git clone 後直接雙擊 `build_exe.bat` 就能打包**，不依賴那台電腦原本裝了什麼版本的 Python 或套件。第一次要連網（約 1-3 分鐘），之後只有 `requirements.txt` 變動才會重新安裝。

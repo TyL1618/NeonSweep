@@ -12,6 +12,7 @@ TEXT_MAIN = "#e8e8f0"
 TEXT_DIM = "#8a8a9a"
 DANGER = "#ff3b5c"
 OK = "#39ffb0"
+WARN = "#ffcc33"
 
 GRADIENT_PINK_BLUE = (
     "qlineargradient(x1:0, y1:0, x2:1, y2:0, "

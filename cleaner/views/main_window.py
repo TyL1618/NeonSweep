@@ -24,6 +24,7 @@ from .diagnostic_page import DiagnosticPage
 from .dupe_page import DupePage
 from .health_page import HealthPage
 from .similarity_page import SimilarityPage
+from .stability_page import StabilityPage
 from .treemap_page import TreemapPage
 
 NAV_ITEMS = [
@@ -33,15 +34,19 @@ NAV_ITEMS = [
     ("similar", "🔍", "相似檔案"),
     ("treemap", "🗺", "空間圖"),
     ("devspace", "⌘", "開發空間"),
-    ("diagnostic", "🩺", "系統診斷"),
+    ("stability", "🖥", "電腦診斷(規格/藍屏)"),
+    ("diagnostic", "🩺", "系統空間診斷"),
     ("health", "💚", "磁碟健康"),
 ]
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, diag_only: bool = False):
+        """diag_only=True:只顯示「電腦診斷」頁、隱藏側邊導覽——給朋友用的簡化模式,
+        打開就只有一顆「開始診斷」鈕,看不到清理/重複檔等功能(見 main.py 的啟動判斷)。
+        """
         super().__init__()
-        self.setWindowTitle("NeonSweep")
+        self.setWindowTitle("NeonSweep 電腦診斷" if diag_only else "NeonSweep")
         self.setWindowIcon(QIcon(icon_path()))
         self.resize(1060, 700)
         self.setMinimumSize(960, 640)
@@ -62,8 +67,9 @@ class MainWindow(QMainWindow):
 
         self._nav_buttons: dict[str, QToolButton] = {}
         sidebar = self._build_sidebar()
+        sidebar_line = GlowLine(orientation="vertical")
         body.addWidget(sidebar)
-        body.addWidget(GlowLine(orientation="vertical"))
+        body.addWidget(sidebar_line)
 
         self._stack = QStackedWidget()
         self._clean_page = CleanPage()
@@ -72,6 +78,7 @@ class MainWindow(QMainWindow):
         self._similarity_page = SimilarityPage()
         self._treemap_page = TreemapPage()
         self._devspace_page = DevSpacePage()
+        self._stability_page = StabilityPage()
         self._diagnostic_page = DiagnosticPage()
         self._health_page = HealthPage()
 
@@ -82,6 +89,7 @@ class MainWindow(QMainWindow):
             "similar": self._similarity_page,
             "treemap": self._treemap_page,
             "devspace": self._devspace_page,
+            "stability": self._stability_page,
             "diagnostic": self._diagnostic_page,
             "health": self._health_page,
         }
@@ -91,8 +99,13 @@ class MainWindow(QMainWindow):
 
         self._clean_page.state_changed.connect(self._on_clean_state_changed)
 
-        self._nav_buttons["clean"].setChecked(True)
-        self._stack.setCurrentWidget(self._clean_page)
+        if diag_only:
+            sidebar.setVisible(False)
+            sidebar_line.setVisible(False)
+            self._stack.setCurrentWidget(self._stability_page)
+        else:
+            self._nav_buttons["clean"].setChecked(True)
+            self._stack.setCurrentWidget(self._clean_page)
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()

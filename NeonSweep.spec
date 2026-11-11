@@ -50,6 +50,9 @@ a = Analysis(
         'cleaner.print_cache',
         'cleaner.diagnostics',
         'cleaner.smart_health',
+        'cleaner.bugcheck_db',
+        'cleaner.crash_analysis',
+        'cleaner.crash_report',
         'cleaner.utils',
         'cleaner.utils.fs',
         'cleaner.utils.admin',
@@ -82,6 +85,7 @@ a = Analysis(
         'cleaner.views.devspace_page',
         'cleaner.views.diagnostic_page',
         'cleaner.views.health_page',
+        'cleaner.views.stability_page',
         # 相似檔案頁面用 opencv;numpy 為其相依。PyInstaller 內建 hook-cv2 會收集 cv2 的 binary,
         # 這裡明確列出確保凍結後不漏。注意下方 excludes 已不再排除 numpy。
         'cv2',

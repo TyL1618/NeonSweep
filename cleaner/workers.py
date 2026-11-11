@@ -2,7 +2,7 @@ import traceback
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from . import analysis, diagnostics, smart_health, treemap
+from . import analysis, crash_analysis, diagnostics, smart_health, treemap
 from .modules.base import ScanCancelled
 from .state import CleanResult, ScanResult
 
@@ -421,6 +421,38 @@ class SmartHealthWorker(QObject):
                     "passed": None,
                 }
                 self.device_found.emit(health)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.finished.emit()
+
+
+class StabilityWorker(QObject):
+    """藍屏與穩定性診斷:蒐集事件記錄/傾印檔/硬體資訊後推論原因方向。唯讀。"""
+
+    progress = pyqtSignal(str, int, int)   # 步驟名稱, 目前第幾步, 總步數
+    result_ready = pyqtSignal(dict, dict)  # (蒐集資料, 推論結果)
+    finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self):
+        try:
+            data = crash_analysis.collect_all(
+                progress_cb=lambda label, i, n: self.progress.emit(label, i, n),
+                cancel_check=lambda: self._cancelled,
+            )
+            if not self._cancelled:
+                self.result_ready.emit(data, crash_analysis.analyze(data))
         except Exception:
             traceback.print_exc()
         finally:
