@@ -41,12 +41,9 @@ NAV_ITEMS = [
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, diag_only: bool = False):
-        """diag_only=True:只顯示「電腦診斷」頁、隱藏側邊導覽——給朋友用的簡化模式,
-        打開就只有一顆「開始診斷」鈕,看不到清理/重複檔等功能(見 main.py 的啟動判斷)。
-        """
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("NeonSweep 電腦診斷" if diag_only else "NeonSweep")
+        self.setWindowTitle("NeonSweep")
         self.setWindowIcon(QIcon(icon_path()))
         self.resize(1060, 700)
         self.setMinimumSize(960, 640)
@@ -67,9 +64,8 @@ class MainWindow(QMainWindow):
 
         self._nav_buttons: dict[str, QToolButton] = {}
         sidebar = self._build_sidebar()
-        sidebar_line = GlowLine(orientation="vertical")
         body.addWidget(sidebar)
-        body.addWidget(sidebar_line)
+        body.addWidget(GlowLine(orientation="vertical"))
 
         self._stack = QStackedWidget()
         self._clean_page = CleanPage()
@@ -99,13 +95,8 @@ class MainWindow(QMainWindow):
 
         self._clean_page.state_changed.connect(self._on_clean_state_changed)
 
-        if diag_only:
-            sidebar.setVisible(False)
-            sidebar_line.setVisible(False)
-            self._stack.setCurrentWidget(self._stability_page)
-        else:
-            self._nav_buttons["clean"].setChecked(True)
-            self._stack.setCurrentWidget(self._clean_page)
+        self._nav_buttons["clean"].setChecked(True)
+        self._stack.setCurrentWidget(self._clean_page)
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()

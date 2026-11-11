@@ -40,17 +40,6 @@ def _setup_logging() -> None:
         pass
 
 
-def _is_diag_mode() -> bool:
-    """給朋友用的「只診斷」簡化模式:命令列帶 --diag,或 exe 檔名含 "diag"(不分大小寫)。
-
-    檔名判斷是為了讓使用者不用教朋友加參數——把 NeonSweep.exe 複製一份改名成
-    NeonSweep-Diag.exe 傳給對方,對方雙擊就只看到診斷頁。同一份程式、同一個 build。
-    """
-    if "--diag" in sys.argv[1:]:
-        return True
-    return "diag" in os.path.basename(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).lower()
-
-
 def main() -> None:
     _setup_logging()
     if sys.platform == "win32":  # 工作列圖示：要在建立任何視窗前設定，否則會顯示 python.exe 的圖示
@@ -61,7 +50,7 @@ def main() -> None:
     app.setStyleSheet(GLOBAL_QSS)
     app.setWindowIcon(QIcon(icon_path()))
 
-    window = MainWindow(diag_only=_is_diag_mode())
+    window = MainWindow()
     window.show()
 
     # 關掉 PyInstaller onefile 打包的啟動畫面(見 NeonSweep.spec 的 Splash())。
