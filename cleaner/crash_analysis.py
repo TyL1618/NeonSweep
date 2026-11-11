@@ -690,8 +690,16 @@ def analyze(data: dict) -> dict:
             add("hardware", 1.5, "停止代碼多變,硬體層級不穩定的可能")
     else:
         dumps_denied = data.get("dumps", {}).get("access_denied")
-        note = "(但目前沒有管理員權限,傾印檔資料夾讀不到,可能漏看)" if dumps_denied else ""
-        findings.append(_finding("ok", f"近 {LOOKBACK_DAYS} 天沒有藍屏紀錄", note))
+        if data.get("crash_settings", {}).get("dump_type") == 0:
+            # 傾印功能被關掉時,藍屏不會留下事件 1001 也沒有 .dmp,「沒有紀錄」≠「沒發生過」。
+            # 朋友的真實報告就是這樣:他明明遇過藍屏,工具卻打了綠色勾勾,等於說謊。
+            findings.append(_finding(
+                "info", f"近 {LOOKBACK_DAYS} 天查不到藍屏紀錄,但不能當作沒發生過",
+                "系統設定為藍屏時不留傾印檔,所以就算藍屏過也不會有紀錄。"
+                "請以使用者實際遇到的狀況為準,並先開啟傾印功能(見下方建議),下次藍屏才查得到原因。"))
+        else:
+            note = "(但目前沒有管理員權限,傾印檔資料夾讀不到,可能漏看)" if dumps_denied else ""
+            findings.append(_finding("ok", f"近 {LOOKBACK_DAYS} 天沒有藍屏紀錄", note))
 
     # 2. 非藍屏的意外關機
     power = data.get("power", {})
