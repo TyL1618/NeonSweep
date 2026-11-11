@@ -370,6 +370,9 @@ def collect_crash_settings() -> dict:
         "auto_reboot": _reg_value(hk, cc, "AutoReboot"),
         "fast_startup": _reg_value(hk, r"SYSTEM\CurrentControlSet\Control\Session Manager\Power",
                                    "HiberbootEnabled"),
+        # 快速啟動是用休眠機制實作的:休眠被關掉(powercfg /h off 或公司政策)時,
+        # HiberbootEnabled 即使是 1 也不會生效,所以兩個值要一起看。
+        "hibernate_enabled": _reg_value(hk, r"SYSTEM\CurrentControlSet\Control\Power", "HibernateEnabled"),
     }
 
 
@@ -796,7 +799,10 @@ def analyze(data: dict) -> dict:
     # 快速啟動讓「關機」變成休眠:下次開機是恢復上次的核心狀態,不是完整開機。
     # 還原軟體只在完整開機時才還原,所以使用者以為「每天關機=每天還原」,實際上可能根本沒還原過。
     # 有些還原軟體(如 Deep Freeze)的官方文件也要求關閉快速啟動。這條是從朋友的真實案例推出來的。
-    fast_startup = data.get("crash_settings", {}).get("fast_startup")
+    cs = data.get("crash_settings", {})
+    # 休眠被關掉時快速啟動無效(按關機=完整關機),此時不能再說「關機不會還原」。
+    # 這條是被朋友的實例糾正的:她的公司筆電休眠被鎖掉,原本的警告在她身上是錯的。
+    fast_startup = 1 if (cs.get("fast_startup") == 1 and cs.get("hibernate_enabled") != 0) else 0
     if restore and fast_startup == 1:
         findings.append(_finding(
             "warn", "「快速啟動」是開啟的,按「關機」不會完整重開機",
@@ -1164,7 +1170,10 @@ def spec_rows(data: dict) -> list[tuple[str, str]]:
         put("電池", f"健康度約 {bat['full_mwh'] / bat['design_mwh'] * 100:.0f}%")
     if data.get("uptime_hours") is not None:
         put("已連續開機", f"{data['uptime_hours']:g} 小時")
-    fs = (data.get("crash_settings") or {}).get("fast_startup")
-    if fs is not None:
-        put("快速啟動", "開啟(按關機=休眠,不是完整重開機)" if fs == 1 else "關閉")
+    cset = data.get("crash_settings") or {}
+    if cset.get("hibernate_enabled") == 0:
+        put("休眠/快速啟動", "休眠已停用(快速啟動無效,關機=完整關機)")
+    elif cset.get("fast_startup") is not None:
+        put("休眠/快速啟動", "快速啟動開啟(按關機=休眠,不是完整重開機)"
+            if cset["fast_startup"] == 1 else "快速啟動關閉")
     return rows
