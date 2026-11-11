@@ -110,17 +110,21 @@ def _local_str(dt: datetime | None) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M") if dt else ""
 
 
-def query_events(cond: str, max_events: int = 200, days: int = LOOKBACK_DAYS,
-                 channel: str = "System") -> list[dict] | None:
+def query_events(cond: str, max_events: int = 200, days: int | None = LOOKBACK_DAYS,
+                 channel: str = "System", newest_first: bool = True) -> list[dict] | None:
     """用 wevtutil 查事件記錄,回傳事件清單(新到舊);查詢本身失敗回傳 None(≠ 查到 0 筆)。
 
     cond 是 XPath 的 System 條件式,例如 "Provider[@Name='disk'] and EventID=7"。
     只保留診斷需要的欄位——刻意**不**帶 Computer、Binary、完整訊息,減少外洩個資的面積。
     """
-    ms = days * 86400 * 1000
-    query = f"*[System[({cond}) and TimeCreated[timediff(@SystemTime) <= {ms}]]]"
+    if days is None:
+        query = f"*[System[({cond})]]"
+    else:
+        ms = days * 86400 * 1000
+        query = f"*[System[({cond}) and TimeCreated[timediff(@SystemTime) <= {ms}]]]"
     raw = _run(
-        ["wevtutil", "qe", channel, f"/q:{query}", f"/c:{max_events}", "/rd:true", "/f:xml"],
+        ["wevtutil", "qe", channel, f"/q:{query}", f"/c:{max_events}",
+         f"/rd:{'true' if newest_first else 'false'}", "/f:xml"],
         timeout=45,
     )
     if raw is None:
@@ -504,6 +508,112 @@ def collect_smart() -> dict:
     return result
 
 
+# ── 還原類軟體與事件記錄跨度 ────────────────────────────────────────────────
+
+# 還原卡/還原軟體(網咖、學校、公司電腦常見)會在每次重開機把系統碟還原成固定狀態。
+# 後果有兩個,都直接影響診斷可信度:
+#   1. 事件記錄、傾印檔、使用者做的設定(含「修好」的設定)重開機後全部消失 → 診斷看不到過去的事。
+#   2. 它們在儲存堆疊裡掛過濾驅動,本身就是 stornvme 逾時/DPC watchdog 這類問題的常見嫌疑。
+# 關鍵字刻意不放「還原」單字:Windows 自己的「系統還原」服務會誤中。
+_RESTORE_KEYWORDS = (
+    "deep freeze", "deepfreeze", "faronics", "dfserv", "farflt",
+    "shadow defender", "shadowdefender", "reboot restore", "rollback rx", "rollbackrx",
+    "horizon datasys", "returnil", "time freeze", "timefreeze", "steadystate", "hdguard",
+    "drive vaccine", "driveshield", "reborn card",
+    "還原卡", "還原精靈", "還原軟體", "硬碟還原", "冰點", "小海豚", "凍結",
+)
+
+
+def _matches_restore(*texts: str) -> bool:
+    blob = " ".join(t for t in texts if t).lower()
+    return any(k in blob for k in _RESTORE_KEYWORDS)
+
+
+def collect_restore_software() -> list[str]:
+    """掃描服務/驅動與已安裝程式,找出還原類軟體。只讀登錄檔,毫秒級。
+
+    只能偵測「軟體型」。純硬體還原卡(桌機 PCI 卡,在 BIOS/磁碟控制層運作)Windows 內看不到,
+    那種情況靠 collect_log_span() 的「事件記錄被重置」間接發現。
+    """
+    if winreg is None:
+        return []
+    found: list[str] = []
+
+    def add(name: str):
+        name = (name or "").strip()
+        if name and name not in found:
+            found.append(name)
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services") as root:
+            i = 0
+            while True:
+                try:
+                    svc = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                # 先用服務名稱快篩,命中才去讀細節,避免對幾百個服務都開一次機碼
+                display = image = ""
+                if not _matches_restore(svc):
+                    continue
+                try:
+                    with winreg.OpenKey(root, svc) as k:
+                        display = str(winreg.QueryValueEx(k, "DisplayName")[0])
+                except OSError:
+                    pass
+                add(display if display and not display.startswith("@") else svc)
+    except OSError:
+        pass
+
+    for hive, path in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ):
+        try:
+            with winreg.OpenKey(hive, path) as root:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(root, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with winreg.OpenKey(root, sub) as k:
+                            name = str(winreg.QueryValueEx(k, "DisplayName")[0])
+                            try:
+                                pub = str(winreg.QueryValueEx(k, "Publisher")[0])
+                            except OSError:
+                                pub = ""
+                    except OSError:
+                        continue
+                    if _matches_restore(name, pub, sub):
+                        add(name)
+        except OSError:
+            pass
+    return found[:6]
+
+
+def collect_log_span() -> dict:
+    """System 事件記錄最舊的一筆是什麼時候,用來判斷記錄是不是被重置過。
+
+    正常電腦的 System 記錄通常能回溯數週到數月。最舊事件只有幾小時/幾天前、但系統其實裝了
+    很久,代表記錄被清掉了(還原機制、有人手動清除、記錄設定過小)——這時「近 90 天沒有藍屏」
+    完全不能當證據。
+    """
+    out = {"oldest_utc": None, "oldest_local": None, "age_days": None}
+    events = query_events("EventID>=0", max_events=1, days=None, newest_first=False)
+    if not events:
+        return out
+    when = _parse_event_time(events[0]["time_utc"]) if events[0].get("time_utc") else None
+    if when:
+        out["oldest_utc"] = when.isoformat()
+        out["oldest_local"] = _local_str(when)
+        out["age_days"] = round((datetime.now(timezone.utc) - when).total_seconds() / 86400, 1)
+    return out
+
+
 # ── 總蒐集 ──────────────────────────────────────────────────────────────────
 
 STEPS = [
@@ -580,6 +690,8 @@ def collect_all(progress_cb=None, cancel_check=None) -> dict:
     data["dumps"] = results.get("dumps") or {}
     data["smart"] = results.get("smart") or {"available": False, "devices": [], "reports": {}}
     data["crash_settings"] = collect_crash_settings()
+    data["restore_software"] = collect_restore_software()
+    data["log_span"] = collect_log_span()
     data["volumes"] = collect_volumes()
     data["uptime_hours"] = uptime_hours()
     data["bugchecks"] = _merge_dump_only(data["bugchecks"], data["dumps"])
@@ -656,6 +768,37 @@ def analyze(data: dict) -> dict:
             "傾印檔資料夾與部分磁碟 SMART 需要管理員權限。若結果顯示「沒有問題」,"
             "建議以系統管理員身分重新啟動後再診斷一次。"))
 
+    # 0.5 還原機制:它會讓「過去的紀錄」整體失效,所以要在判讀其他項目之前先確定
+    restore = data.get("restore_software") or []
+    span = data.get("log_span") or {}
+    log_age = span.get("age_days")
+    try:
+        install_age = (datetime.now() - datetime.strptime(system.get("install_date") or "", "%Y-%m-%d")).days
+    except ValueError:
+        install_age = None
+    # 記錄比系統安裝時間短很多才算「被重置」(剛重灌的電腦記錄本來就短,不能誤判)
+    log_short = (log_age is not None and log_age < 14
+                 and (install_age is None or install_age > log_age + 7))
+    records_unreliable = bool(restore) or log_short
+    if restore:
+        findings.append(_finding(
+            "warn", "偵測到還原/凍結類軟體:" + "、".join(restore),
+            "這類軟體在每次重開機時把系統碟還原成固定狀態。後果:\n"
+            "① 事件記錄、藍屏傾印檔、以及你在電腦上做的任何設定或驅動更新,重開機後都會消失,"
+            "所以這份診斷只能看到「本次開機以來」的事,看不到過去的藍屏。\n"
+            "② 它們會在儲存堆疊掛過濾驅動,本身就是 NVMe 逾時、DPC_WATCHDOG 這類問題的常見嫌疑。",
+            ["要修改任何東西(更新驅動、改電源設定、開傾印)之前,先把還原軟體切到「解凍/維護模式」,"
+             "否則重開機就全部還原回去,等於白改",
+             "確認問題的方法:在管理員同意下,暫時停用或移除還原軟體使用幾天,看藍屏是否消失",
+             "要抓藍屏證據,需在解凍狀態下開啟傾印功能,並讓藍屏發生在解凍的那次開機"]))
+        add("storage", 4.0, "還原軟體會在儲存堆疊掛過濾驅動,是儲存逾時的常見嫌疑")
+        add("driver", 2.0, "還原軟體的核心驅動可能與其他驅動衝突")
+    if log_short:
+        findings.append(_finding(
+            "warn", f"事件記錄只回溯到 {span.get('oldest_local')}(約 {log_age:g} 天)",
+            "但系統已安裝較久,代表事件記錄被重置過(還原機制、手動清除或記錄空間設太小)。"
+            "此時「沒有藍屏紀錄」完全不能當作證據,診斷結果只反映最近這段時間。"))
+
     # 1. 藍屏
     bugchecks = data.get("bugchecks", [])
     if bugchecks:
@@ -690,13 +833,15 @@ def analyze(data: dict) -> dict:
             add("hardware", 1.5, "停止代碼多變,硬體層級不穩定的可能")
     else:
         dumps_denied = data.get("dumps", {}).get("access_denied")
-        if data.get("crash_settings", {}).get("dump_type") == 0:
-            # 傾印功能被關掉時,藍屏不會留下事件 1001 也沒有 .dmp,「沒有紀錄」≠「沒發生過」。
+        if data.get("crash_settings", {}).get("dump_type") == 0 or records_unreliable:
+            # 傾印被關掉、或紀錄會被還原/清除時,「沒有紀錄」≠「沒發生過」。
             # 朋友的真實報告就是這樣:他明明遇過藍屏,工具卻打了綠色勾勾,等於說謊。
+            why = ("這台電腦有還原機制/事件記錄被重置過" if records_unreliable
+                   else "系統設定為藍屏時不留傾印檔")
             findings.append(_finding(
                 "info", f"近 {LOOKBACK_DAYS} 天查不到藍屏紀錄,但不能當作沒發生過",
-                "系統設定為藍屏時不留傾印檔,所以就算藍屏過也不會有紀錄。"
-                "請以使用者實際遇到的狀況為準,並先開啟傾印功能(見下方建議),下次藍屏才查得到原因。"))
+                f"{why},所以就算藍屏過也不會有紀錄。"
+                "請以使用者實際遇到的狀況為準;要查原因,需先讓傾印功能開啟且紀錄能保留下來。"))
         else:
             note = "(但目前沒有管理員權限,傾印檔資料夾讀不到,可能漏看)" if dumps_denied else ""
             findings.append(_finding("ok", f"近 {LOOKBACK_DAYS} 天沒有藍屏紀錄", note))
@@ -754,9 +899,13 @@ def analyze(data: dict) -> dict:
                 ["多半是傳輸線、USB 埠或外接碟本身問題;若藍屏與此無關可忽略"]))
         else:
             sev = "bad" if (severe or n >= 5) else "warn"
+            advice = ["先備份重要資料", "查看該磁碟的 SMART 健康度", "更新 SSD 韌體與儲存驅動;換排線/插槽測試(桌機)"]
+            if restore:
+                advice.insert(0, "此機有還原軟體:先排除它(解凍後暫停用/移除測試),它的儲存過濾驅動是首要嫌疑")
             findings.append(_finding(
-                sev, f"儲存裝置在近 {LOOKBACK_DAYS} 天內有 {n} 筆錯誤事件", "\n".join(lines),
-                ["先備份重要資料", "查看該磁碟的 SMART 健康度", "更新 SSD 韌體與儲存驅動;換排線/插槽測試(桌機)"]))
+                sev, f"儲存裝置在近 {LOOKBACK_DAYS} 天內有 {n} 筆錯誤事件"
+                     + ("(只含最近一次開機以來)" if records_unreliable else ""),
+                "\n".join(lines), advice))
             add("storage", 8.0 if (severe or n >= 5) else 4.0, "事件檢視器有磁碟/儲存控制器層級的錯誤")
     else:
         findings.append(_finding("ok", "沒有發現磁碟/儲存控制器錯誤事件"))
@@ -847,8 +996,10 @@ def analyze(data: dict) -> dict:
     if settings.get("dump_type") == 0:
         findings.append(_finding(
             "warn", "系統設定為「藍屏時不產生傾印檔」",
-            "這樣即使藍屏也不會留下證據,無法事後分析。",
-            ["系統內容 → 進階 → 啟動及修復 → 設定 → 偵錯資訊寫入:選「自動記憶體傾印」"]))
+            "這樣即使藍屏也不會留下證據,無法事後分析。"
+            + ("\n⚠ 此機有還原機制:設定會在重開機後被還原回去,可能正是它把傾印關掉的。" if records_unreliable else ""),
+            ["系統內容 → 進階 → 啟動及修復 → 設定 → 偵錯資訊寫入:選「自動記憶體傾印」"
+             + (("(要先解凍再改,否則重開機會還原)") if records_unreliable else "")]))
 
     # 9. 剩餘空間
     sysdrive = os.environ.get("SystemDrive", "C:").upper() + "\\"
@@ -991,6 +1142,8 @@ def spec_rows(data: dict) -> list[tuple[str, str]]:
     for v in data.get("volumes", []):
         put(f"磁碟 {v['drive'][:1]} 槽", f"總容量 {_gb(v['total'])},剩餘 {_gb(v['free'])}")
 
+    if data.get("restore_software"):
+        put("還原軟體", "、".join(data["restore_software"]))
     put("主機板", s.get("board"))
     if s.get("bios_version"):
         put("BIOS", f"{s['bios_version']}({s.get('bios_date') or '?'})")
