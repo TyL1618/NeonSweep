@@ -419,6 +419,13 @@ $o.gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object {
 $o.physical_disks = @(Get-PhysicalDisk | ForEach-Object {
   @{ number = $_.DeviceId; name = $_.FriendlyName; media = [string]$_.MediaType; bus = [string]$_.BusType;
      health = [string]$_.HealthStatus; status = [string]$_.OperationalStatus; gb = [math]::Round($_.Size / 1GB, 0) } })
+$o.disks = @(Get-Disk | ForEach-Object {
+  @{ number = $_.Number; bytes = $_.Size; style = [string]$_.PartitionStyle; allocated = $_.AllocatedSize;
+     largest_free = $_.LargestFreeExtent; bus = [string]$_.BusType; name = $_.FriendlyName } })
+$o.partitions = @(Get-Partition | ForEach-Object {
+  $v = $_ | Get-Volume -ErrorAction SilentlyContinue
+  @{ disk = $_.DiskNumber; number = $_.PartitionNumber; letter = [string]$_.DriveLetter; type = [string]$_.Type;
+     bytes = $_.Size; hidden = [bool]$_.IsHidden; is_system = [bool]$_.IsSystem; fs = [string]$v.FileSystem } })
 $design = (Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData | Select-Object -First 1).DesignedCapacity
 $full = (Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity | Select-Object -First 1).FullChargedCapacity
 if ($design -and $full) { $o.battery = @{ design_mwh = $design; full_mwh = $full } }
@@ -460,8 +467,11 @@ def collect_system_info() -> dict | None:
     info = _run_ps_json(_PS_SPECS, timeout=60)
     if info is None:
         return None
-    for key in ("memory_modules", "gpus", "physical_disks"):
+    for key in ("memory_modules", "gpus", "physical_disks", "disks", "partitions"):
         info[key] = _as_list(info.get(key))
+    for part in info["partitions"]:
+        # PowerShell 對「沒有磁碟代號」回傳 NUL 字元(\u0000),不是空字串——不清掉會被當成有代號
+        part["letter"] = (part.get("letter") or "").strip("\x00 ")
     return info
 
 
@@ -1031,6 +1041,29 @@ def analyze(data: dict) -> dict:
                     "空間太滿會拖慢系統,也讓 Windows 更新與虛擬記憶體出問題。",
                     ["用本程式的「清理」與「大檔案」功能釋放空間"]))
 
+    # 9.5 磁碟分割:只看中繼資料,不碰內容。大量「看不到」的容量值得讓人知道,但原因多半平淡
+    #     (映像沒擴充),所以只給 info,不當成問題、也不亂猜用途。
+    for d in system.get("disks", []):
+        total = d.get("bytes") or 0
+        free = d.get("largest_free") or 0
+        if total and free >= 20 * 1024**3 and free / total >= 0.1:
+            findings.append(_finding(
+                "info", f"磁碟 {d.get('number')} 有 {_gb(free)} 未配置空間(沒被任何分割使用)",
+                "常見原因:灌系統映像時沒有擴充分割;有些還原軟體也會把空間留給自己用。"
+                "這些空間在檔案總管看不到,只有「磁碟管理」會顯示成黑色未配置區塊。"))
+    for p in system.get("partitions", []):
+        big = (p.get("bytes") or 0) >= _BIG_PART_BYTES
+        if not big or p.get("letter"):
+            continue
+        if p.get("type") in ("System", "Reserved", "Recovery"):
+            continue
+        fs = p.get("fs") or ""
+        findings.append(_finding(
+            "info", f"磁碟 {p.get('disk')} 分割 {p.get('number')}:{_gb(p['bytes'])},沒有磁碟代號"
+                    + ("" if fs else ",且無法辨識檔案系統"),
+            "沒有代號的分割在檔案總管看不到。可能是還原軟體的保護區、備份區,或是加密/未格式化的磁碟區。"
+            "這個工具只讀大小與類型,不會讀取內容,所以無法判斷裡面是什麼。"))
+
     # 10. 老舊驅動(排除微軟內建)
     old = []
     for drv in system.get("drivers", []):
@@ -1105,8 +1138,36 @@ _MEMORY_TYPES = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 29: "LPDDR3", 30
 
 def _gb(n: int) -> str:
     """位元組 → 'xxx GB' / 'x.x TB'(磁碟廠商用 1000 進位,但 Windows 顯示 1024;這裡跟 Windows 一致)。"""
+    if n < 1024**3:
+        return f"{n / 1024**2:.0f} MB"
     gb = n / 1024**3
     return f"{gb / 1024:.1f} TB" if gb >= 1000 else f"{gb:.0f} GB"
+
+
+_PART_TYPES = {"System": "EFI 系統", "Reserved": "MSR 保留", "Recovery": "復原", "Basic": "一般資料",
+               "Unknown": "未知類型", "IFS": "一般資料", "": "未知類型"}
+_BIG_PART_BYTES = 20 * 1024**3
+
+
+def partition_lines(system: dict) -> list[str]:
+    """把每顆磁碟的分割表整理成人話:每個分割的大小/類型/代號/檔案系統,以及未配置空間。"""
+    out = []
+    parts = system.get("partitions", [])
+    for d in system.get("disks", []):
+        total = d.get("bytes") or 0
+        head = f"磁碟 {d.get('number')}({d.get('style')},{_gb(total)})"
+        items = []
+        for p in sorted((x for x in parts if x.get("disk") == d.get("number")),
+                        key=lambda x: x.get("number") or 0):
+            label = _PART_TYPES.get(p.get("type", ""), p.get("type") or "未知")
+            letter = f" {p['letter']}:" if p.get("letter") else "(無代號)"
+            fs = p.get("fs") or ("" if p.get("type") in ("System", "Reserved") else "無法辨識檔案系統")
+            items.append(f"{label}{letter} {_gb(p.get('bytes') or 0)} {fs}".rstrip())
+        free = d.get("largest_free") or 0
+        if free >= 1024**3:
+            items.append(f"未配置空間 {_gb(free)}")
+        out.append(head + ":" + "; ".join(items) if items else head)
+    return out
 
 
 def spec_rows(data: dict) -> list[tuple[str, str]]:
@@ -1162,6 +1223,8 @@ def spec_rows(data: dict) -> list[tuple[str, str]]:
 
     if data.get("restore_software"):
         put("還原軟體", "、".join(data["restore_software"]))
+    for line in partition_lines(s):
+        put("磁碟分割", line)
     put("主機板", s.get("board"))
     if s.get("bios_version"):
         put("BIOS", f"{s['bios_version']}({s.get('bios_date') or '?'})")
